@@ -1476,8 +1476,8 @@ class AiterAttnBackend(AttentionBackend):
                             k = k.float().to(fp8_dtype)
                         if v.dtype != fp8_dtype:
                             v = v.float().to(fp8_dtype)
-                        one_scale = torch.tensor(
-                            1.0, dtype=torch.float32, device=q.device
+                        one_scale = torch.ones(
+                            (), dtype=torch.float32, device=q.device
                         )
 
                         kv_indptr_asm = qo_indptr
