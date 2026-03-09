@@ -225,7 +225,7 @@ def init_mori_op(
     rdma_block_num = cfg.rdma_block_num
 
     hidden_dim = hidden_size
-    scale_dim = hidden_size
+    scale_dim = 1
     data_type = fp8_dtype
     scale_type_size = torch.float32.itemsize
 
