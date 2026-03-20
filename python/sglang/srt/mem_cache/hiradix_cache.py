@@ -514,8 +514,10 @@ class HiRadixCache(RadixCache):
                 if entry is not None:
                     entry.release_host()
                 if log_metrics and self.enable_storage_metrics:
-                    self.storage_metrics_collector.log_backuped_tokens(
-                        operation.completed_tokens
+                    backuped_tokens = int(operation.completed_tokens)
+                    self.storage_metrics_collector.log_backuped_tokens(backuped_tokens)
+                    self.storage_metrics_collector.log_backuped_bytes(
+                        self._tokens_to_logical_bytes(backuped_tokens)
                     )
 
         def _drain_release():
@@ -808,6 +810,23 @@ class HiRadixCache(RadixCache):
         """Convert raw token_ids to a RadixKey; must be list (not tuple) for paged match."""
         return RadixKey(token_ids=list(token_ids))
 
+    def _tokens_to_logical_bytes(self, num_tokens: int) -> int:
+        """Convert token count to logical KV bytes using host-pool basis."""
+        if num_tokens <= 0:
+            return 0
+        bytes_per_token = getattr(self.token_to_kv_pool_host, "size_per_token", None)
+        if bytes_per_token is None:
+            bytes_per_token = self.token_to_kv_pool_host.get_size_per_token()
+        return int(num_tokens) * int(bytes_per_token)
+
+    @staticmethod
+    def _to_gb_per_second(num_bytes: int, duration_seconds: float) -> float:
+        """Convert bytes/duration to GB/s with safe zero-duration handling."""
+        if num_bytes <= 0:
+            return 0.0
+        duration_seconds = max(duration_seconds, 1e-9)
+        return float(num_bytes) / duration_seconds / float(1024**3)
+
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:
             return IncLockRefResult(delta=0)
@@ -847,7 +866,7 @@ class HiRadixCache(RadixCache):
         return DecLockRefResult(delta=delta)
 
     def _update_host_leaf_status(self, node: TreeNode):
-        if not node.evicted or node.lock_ref > 0:
+        if not node.evicted or node.lock_ref > 0 or node.host_value is None:
             if node in self.evictable_host_leaves:
                 self.evictable_host_leaves.remove(node)
             return
@@ -907,6 +926,12 @@ class HiRadixCache(RadixCache):
                 self._evict_backuped(node)
 
         self.update_eviction_metrics(num_evicted, start_time)
+        if self.metrics_collector is not None and num_evicted > 0:
+            evicted_bytes = self._tokens_to_logical_bytes(num_evicted)
+            self.metrics_collector.increment_eviction_num_bytes(evicted_bytes)
+            self.metrics_collector.observe_eviction_bandwidth_gb_s(
+                self._to_gb_per_second(evicted_bytes, time.perf_counter() - start_time)
+            )
         return EvictResult(num_tokens_evicted=num_evicted)
 
     def _evict_backuped(self, node: TreeNode):
@@ -953,10 +978,20 @@ class HiRadixCache(RadixCache):
             if x.host_ref_counter > 0:
                 continue
 
+            # Verify node is still in the tree — it may have been removed
+            # by a prior evict_host call within the same evict() invocation
+            # and re-added to evictable_host_leaves by _update_host_leaf_status.
+            key = self.get_child_key_fn(x.key)
+            if x.parent.children.get(key) is not x:
+                if x in self.evictable_host_leaves:
+                    self.evictable_host_leaves.remove(x)
+                continue
+
             # Block deleted entirely (GPU already evicted, now CPU freed) --
             # emit remove(CPU) so the router drops the host-tier entry.
             self._record_remove_event(x, medium=StorageMedium.CPU)
             num_evicted += self.cache_controller.evict_host(x.host_value)
+            x.host_value = None
 
             key = x.key.child_key(self.page_size)
             v = x.parent.children.pop(key, None)
@@ -1034,10 +1069,14 @@ class HiRadixCache(RadixCache):
         self.inc_lock_ref(last_hit_node)
 
         if self.metrics_collector is not None:
-            self.metrics_collector.observe_load_back_duration(
-                time.perf_counter() - start_time
-            )
+            elapsed_seconds = time.perf_counter() - start_time
+            loaded_bytes = self._tokens_to_logical_bytes(len(device_indices))
+            self.metrics_collector.observe_load_back_duration(elapsed_seconds)
             self.metrics_collector.increment_load_back_num_tokens(len(device_indices))
+            self.metrics_collector.increment_load_back_num_bytes(loaded_bytes)
+            self.metrics_collector.observe_load_back_bandwidth_gb_s(
+                self._to_gb_per_second(loaded_bytes, elapsed_seconds)
+            )
 
         return device_indices
 
@@ -1202,6 +1241,9 @@ class HiRadixCache(RadixCache):
 
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
+            self.storage_metrics_collector.log_prefetched_bytes(
+                self._tokens_to_logical_bytes(loaded_from_storage)
+            )
 
         return True
 
