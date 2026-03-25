@@ -985,9 +985,14 @@ def calculate_metrics(
             )
             retokenized_output_lens.append(retokenized_output_len)
             if input_requests is not None:
-                total_input += input_requests[i].prompt_len
-                total_input_text += input_requests[i].text_prompt_len
-                total_input_vision += input_requests[i].vision_prompt_len
+                if isinstance(input_requests[i], dict):
+                    total_input += input_requests[i].get("input_length", 0)
+                    total_input_text += input_requests[i].get("input_length", 0)
+                    total_input_vision += 0
+                else:
+                    total_input += input_requests[i].prompt_len
+                    total_input_text += input_requests[i].text_prompt_len
+                    total_input_vision += input_requests[i].vision_prompt_len
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             if use_retokenized_itl:
@@ -1192,12 +1197,16 @@ async def benchmark(
     # Check for multi-turn: prompt is a list of strings (not OpenAI messages dicts)
     # Multi-turn format: ["turn1", "turn2", ...] - list of strings
     # OpenAI format: [{"role": "user", "content": "..."}, ...] - list of dicts
-    first_prompt = input_requests[0].prompt
-    is_multi_turn = (
-        isinstance(first_prompt, list)
-        and len(first_prompt) > 0
-        and isinstance(first_prompt[0], str)
-    )
+    # For mooncake, input_requests are dicts, skip multi-turn check
+    if isinstance(input_requests[0], dict):
+        is_multi_turn = False
+    else:
+        first_prompt = input_requests[0].prompt
+        is_multi_turn = (
+            isinstance(first_prompt, list)
+            and len(first_prompt) > 0
+            and isinstance(first_prompt[0], str)
+        )
     if is_multi_turn:
         request_func = wrap_multi_turn_request_func(request_func, backend=backend)
 
