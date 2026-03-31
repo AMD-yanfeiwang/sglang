@@ -752,8 +752,22 @@ class EAGLEWorkerV2(BaseSpecWorker):
         bs = len(batch.seq_lens)
 
         # Batch 1: Target verify
+        # Capture the main compute stream BEFORE entering plan_stream context,
+        # because current_stream() inside plan_stream_ctx returns plan_stream.
+        main_stream = torch.get_device_module(self.device).current_stream()
+
         # Prepare for target verify in a separate stream
         with self.plan_stream_ctx:
+            # The plan_stream must wait for the main stream to finish draft()
+            # before calling prepare_for_v2_verify(), because:
+            # 1. prepare_for_v2_verify -> assign_extend_cache_locs_func WRITES
+            #    to req_to_token_pool.req_to_token
+            # 2. Draft CUDA graphs on the main stream may still be READING
+            #    req_to_token for KV cache lookups
+            # Without this sync, a race condition causes GPU memory faults
+            # in _fused_qk_rope_cat_and_cache_mla_kernel.
+            if self.plan_stream:
+                self.plan_stream.wait_stream(main_stream)
             verify_forward_batch, can_run_cuda_graph = (
                 verify_input.prepare_for_v2_verify(
                     self.req_to_token_pool,
