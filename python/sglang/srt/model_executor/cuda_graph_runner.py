@@ -1066,6 +1066,7 @@ class CudaGraphRunner:
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        skip_metadata_init: bool = False,
     ):
         buffers = self.buffers
         self.recapture_if_needed(forward_batch)
@@ -1111,21 +1112,22 @@ class CudaGraphRunner:
         if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
             forward_batch.spec_info.custom_mask = buffers.custom_mask
         # Attention backend
-        if self.enable_pdmux:
-            stream_idx = get_current_stream_idx()
-            attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
-        else:
-            attn_backend = self.model_runner.attn_backend
-        attn_backend.init_forward_metadata_replay_cuda_graph(
-            bs,
-            buffers.req_pool_indices[:bs],
-            buffers.seq_lens[:bs],
-            forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
-            buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
-            self.capture_forward_mode,
-            forward_batch.spec_info,
-            seq_lens_cpu=buffers.seq_lens_cpu[:bs],
-        )
+        if not skip_metadata_init:
+            if self.enable_pdmux:
+                stream_idx = get_current_stream_idx()
+                attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
+            else:
+                attn_backend = self.model_runner.attn_backend
+            attn_backend.init_forward_metadata_replay_cuda_graph(
+                bs,
+                buffers.req_pool_indices[:bs],
+                buffers.seq_lens[:bs],
+                forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
+                buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
+                self.capture_forward_mode,
+                forward_batch.spec_info,
+                seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+            )
 
         # Store fields
         self.raw_bs = raw_bs

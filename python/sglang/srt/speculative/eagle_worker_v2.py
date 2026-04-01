@@ -1,3 +1,4 @@
+import bisect
 import contextlib
 import logging
 import time
@@ -27,7 +28,11 @@ from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
@@ -738,6 +743,86 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
             return batch_output
 
+    def _pre_compute_verify_metadata(self, batch: ModelWorkerBatch, verify_input):
+        """Pre-compute attention metadata on plan_stream using only draft-independent data.
+
+        For MLA TARGET_VERIFY, init_forward_metadata_replay_cuda_graph uses only
+        seq_lens, req_pool_indices, and constants -- no draft output tensors.
+        This allows true parallelism with draft CUDA graph on main_stream.
+
+        Returns True if metadata was computed, False otherwise.
+        """
+        graph_runner = self.target_worker.model_runner.graph_runner
+        if graph_runner is None or batch.forward_mode.is_idle():
+            return False
+
+        # Prevent PyTorch from freeing tensors allocated on other streams
+        # while plan_stream is reading them.
+        if self.plan_stream:
+            batch.seq_lens.record_stream(self.plan_stream)
+            batch.req_pool_indices.record_stream(self.plan_stream)
+
+        raw_bs = len(batch.seq_lens)
+        raw_num_token = raw_bs * graph_runner.num_tokens_per_bs
+
+        # Compute padded bs using the SAME logic as replay_prepare.
+        # With require_mlp_tp_gather (DP attention), bs is derived from
+        # max(global_num_tokens) across all DP ranks, NOT local raw_bs.
+        if graph_runner.require_mlp_tp_gather and batch.global_num_tokens is not None:
+            # Adjust global_num_tokens by spec coefficient (same as ForwardBatch.init_new)
+            c1, _ = verify_input.get_spec_adjust_token_coefficient()
+            adjusted_global = [x * c1 for x in batch.global_num_tokens]
+            max_num_tokens = max(adjusted_global)
+            if (
+                self.target_worker.model_runner.spec_algorithm.is_eagle()
+                or self.target_worker.model_runner.spec_algorithm.is_standalone()
+            ):
+                max_batch_size = max_num_tokens / graph_runner.num_tokens_per_bs
+            else:
+                max_batch_size = max_num_tokens
+            index = bisect.bisect_left(graph_runner.capture_bs, max_batch_size)
+        else:
+            index = bisect.bisect_left(graph_runner.capture_bs, raw_bs)
+
+        if index >= len(graph_runner.capture_bs):
+            return False
+        bs = graph_runner.capture_bs[index]
+
+        buffers = graph_runner.buffers
+
+        # Pad and copy draft-independent data to graph buffers
+        if bs != raw_bs:
+            buffers.seq_lens.fill_(graph_runner.seq_len_fill_value)
+            buffers.out_cache_loc.zero_()
+        buffers.req_pool_indices[:raw_bs].copy_(batch.req_pool_indices)
+        buffers.seq_lens[:raw_bs].copy_(batch.seq_lens)
+        if batch.seq_lens_cpu is not None:
+            if bs != raw_bs:
+                buffers.seq_lens_cpu.fill_(graph_runner.seq_len_fill_value)
+            buffers.seq_lens_cpu[:raw_bs].copy_(batch.seq_lens_cpu)
+
+        # Compute attention metadata (expensive MLA work -- draft-independent)
+        attn_backend = self.target_worker.model_runner.attn_backend
+        seq_lens_sum = (
+            batch.seq_lens_sum + (bs - raw_bs) * graph_runner.seq_len_fill_value
+        )
+        attn_backend.init_forward_metadata_replay_cuda_graph(
+            bs,
+            buffers.req_pool_indices[:bs],
+            buffers.seq_lens[:bs],
+            seq_lens_sum,
+            None,  # encoder_lens
+            ForwardMode.TARGET_VERIFY,
+            verify_input,
+            seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+        )
+
+        # Store fields for later use by replay()
+        graph_runner.raw_bs = raw_bs
+        graph_runner.raw_num_token = raw_num_token
+        graph_runner.bs = bs
+        return True
+
     def verify(self, batch: ModelWorkerBatch):
         # Since batch.seq_lens is allocated in another stream, we need
         # record_stream() to prevent pytorch gc and reuse the gpu memory
@@ -751,34 +836,28 @@ class EAGLEWorkerV2(BaseSpecWorker):
         verify_input.num_tokens_per_req = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
 
-        # Batch 1: Target verify
-        # Prepare for target verify in a separate stream
+        # Pre-compute attention metadata on plan_stream (overlaps with draft).
+        # Only skip metadata init in prepare_for_v2_verify when pre-compute
+        # actually ran (it skips for idle batches and out-of-range bs).
+        metadata_computed = False
         with self.plan_stream_ctx:
-            verify_forward_batch, can_run_cuda_graph = (
-                verify_input.prepare_for_v2_verify(
-                    self.req_to_token_pool,
-                    batch,
-                    self.target_worker,
-                )
-            )
+            metadata_computed = self._pre_compute_verify_metadata(batch, verify_input)
 
-        # Correct some buffers due to the overlap plan
-        if self.plan_stream:
+        # Wait for plan_stream metadata computation to finish
+        if self.plan_stream and metadata_computed:
             torch.get_device_module(self.device).current_stream().wait_stream(
                 self.plan_stream
             )
 
-            # Some values such as custom_mask and position depend on the output of draft,
-            # so the previous plan step used the wrong values. Here, we need to run the related
-            # computation again to update them to the correct values.
-            self.target_worker.model_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
-                verify_input,
-                (
-                    self.target_worker.model_runner.graph_runner.bs
-                    if can_run_cuda_graph
-                    else None
-                ),
-            )
+        # Prepare ForwardBatch with draft-dependent data and populate graph
+        # buffers. Skip metadata init only if it was already computed above.
+        skip_metadata = bool(self.plan_stream) and metadata_computed
+        verify_forward_batch, can_run_cuda_graph = verify_input.prepare_for_v2_verify(
+            self.req_to_token_pool,
+            batch,
+            self.target_worker,
+            skip_metadata_init=skip_metadata,
+        )
 
         # Prepare grammar data on CPU if needed
         if batch.has_grammar:

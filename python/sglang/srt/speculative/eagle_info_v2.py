@@ -216,6 +216,7 @@ class EagleVerifyInputV2Mixin:
         req_to_token_pool: ReqToTokenPool,
         batch: ModelWorkerBatch,
         target_worker: TpModelWorker,
+        skip_metadata_init: bool = False,
     ):
         if not batch.forward_mode.is_idle():
             # Assign cache locations
@@ -258,7 +259,9 @@ class EagleVerifyInputV2Mixin:
             and target_worker.model_runner.graph_runner.can_run(verify_forward_batch)
         )
         if can_run_cuda_graph:
-            target_worker.model_runner.graph_runner.replay_prepare(verify_forward_batch)
+            target_worker.model_runner.graph_runner.replay_prepare(
+                verify_forward_batch, skip_metadata_init=skip_metadata_init
+            )
         else:
             if not batch.forward_mode.is_idle():
                 target_worker.model_runner.attn_backend.init_forward_metadata(
