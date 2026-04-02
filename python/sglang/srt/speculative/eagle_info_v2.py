@@ -216,21 +216,45 @@ class EagleVerifyInputV2Mixin:
         req_to_token_pool: ReqToTokenPool,
         batch: ModelWorkerBatch,
         target_worker: TpModelWorker,
+        pre_compute_metadata: bool = False,
     ):
         if not batch.forward_mode.is_idle():
             # Assign cache locations
             bs = len(batch.req_pool_indices)
-            batch.input_ids = self.draft_token
-            device = batch.input_ids.device
-            batch.out_cache_loc = assign_extend_cache_locs_func(
-                req_pool_indices=batch.req_pool_indices,
-                req_to_token=req_to_token_pool.req_to_token,
-                start_offset=batch.seq_lens,
-                end_offset=batch.seq_lens + self.draft_token_num,
-                batch_size=bs,
-                draft_token_num=self.draft_token_num,
-                device=device,
-            )
+            if pre_compute_metadata:
+                placeholder_dtype = (
+                    batch.input_ids.dtype
+                    if batch.input_ids is not None
+                    else (
+                        self.draft_token.dtype
+                        if self.draft_token is not None
+                        else torch.int32
+                    )
+                )
+                batch.input_ids = torch.empty(
+                    (bs * self.draft_token_num,),
+                    dtype=placeholder_dtype,
+                    device=batch.seq_lens.device,
+                )
+                # Metadata-only precompute must not read draft-dependent req_to_token slots.
+                out_cache_dtype = torch.int32 if _is_npu else torch.int64
+                batch.out_cache_loc = torch.zeros(
+                    (bs * self.draft_token_num,),
+                    dtype=out_cache_dtype,
+                    device=batch.seq_lens.device,
+                )
+            else:
+                batch.input_ids = self.draft_token
+                device = batch.input_ids.device
+                batch.out_cache_loc = assign_extend_cache_locs_func(
+                    req_pool_indices=batch.req_pool_indices,
+                    req_to_token=req_to_token_pool.req_to_token,
+                    start_offset=batch.seq_lens,
+                    end_offset=batch.seq_lens + self.draft_token_num,
+                    batch_size=bs,
+                    draft_token_num=self.draft_token_num,
+                    device=device,
+                )
 
             # Set mamba_track_indices for mamba prefix-cache state tracking
             if get_global_server_args().enable_mamba_extra_buffer():
@@ -257,10 +281,17 @@ class EagleVerifyInputV2Mixin:
             target_worker.model_runner.graph_runner
             and target_worker.model_runner.graph_runner.can_run(verify_forward_batch)
         )
+
+        # Metadata-only precompute phase intentionally avoids launching metadata init kernels.
+        if pre_compute_metadata:
+            return verify_forward_batch, can_run_cuda_graph
+
         if can_run_cuda_graph:
-            target_worker.model_runner.graph_runner.replay_prepare(verify_forward_batch)
+            target_worker.model_runner.graph_runner.replay_prepare(
+                verify_forward_batch,
+            )
         else:
-            if not batch.forward_mode.is_idle():
+            if not batch.forward_mode.is_idle() and not pre_compute_metadata:
                 target_worker.model_runner.attn_backend.init_forward_metadata(
                     verify_forward_batch
                 )

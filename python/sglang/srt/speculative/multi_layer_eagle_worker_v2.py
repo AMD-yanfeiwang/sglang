@@ -43,13 +43,15 @@ from sglang.srt.speculative.spec_utils import (
     maybe_detect_oob,
     select_top_k_tokens,
 )
-from sglang.srt.utils.common import empty_context, fast_topk
+from sglang.srt.utils.common import empty_context, fast_topk, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner, ModelRunnerOutput
 
 
 logger = logging.getLogger(__name__)
+
+_is_hip = is_hip()
 
 
 def _get_plan_stream(
@@ -621,6 +623,14 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
+    def _should_use_overlap_verify_metadata_precompute(self) -> bool:
+        if not self.plan_stream or not _is_hip:
+            return False
+        attn_backend_name = (
+            type(self.target_worker.model_runner.attn_backend).__name__.lower()
+        )
+        return "aiter" in attn_backend_name
+
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
         if (
             model_worker_batch.forward_mode.is_extend()
@@ -677,23 +687,40 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         verify_input: EagleVerifyInput = batch.spec_info
         bs = len(batch.seq_lens)
 
+        use_staged_verify_prepare = self._should_use_overlap_verify_metadata_precompute()
+
         # Batch 1: Target verify
-        # Prepare for target verify in a separate stream
-        with self.plan_stream_ctx:
-            verify_forward_batch, can_run_cuda_graph = (
+        # Prepare metadata in plan_stream and finalize draft-dependent fields in main stream.
+        if use_staged_verify_prepare:
+            with self.plan_stream_ctx:
                 verify_input.prepare_for_v2_verify(
                     self.req_to_token_pool,
                     batch,
                     self.target_worker,
+                    pre_compute_metadata=True,
                 )
-            )
+        else:
+            with self.plan_stream_ctx:
+                verify_forward_batch, can_run_cuda_graph = (
+                    verify_input.prepare_for_v2_verify(
+                        self.req_to_token_pool,
+                        batch,
+                        self.target_worker,
+                    )
+                )
 
-        # Correct some buffers due to the overlap plan
         if self.plan_stream:
             torch.get_device_module(self.device).current_stream().wait_stream(
                 self.plan_stream
             )
 
+        if use_staged_verify_prepare:
+            verify_forward_batch, can_run_cuda_graph = verify_input.prepare_for_v2_verify(
+                self.req_to_token_pool,
+                batch,
+                self.target_worker,
+            )
+        elif self.plan_stream:
             # Some values such as custom_mask and position depend on the output of draft,
             # so the previous plan step used the wrong values. Here, we need to run the related
             # computation again to update them to the correct values.
