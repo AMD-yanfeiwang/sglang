@@ -578,6 +578,20 @@ class EagleDraftWorker(BaseDraftWorker):
         if forward_batch.spec_info.accept_length is None:
             forward_batch.spec_info.accept_length = batch_result.accept_lens
 
+        # Record shared buffers on default stream
+        if self.plan_stream:
+            _cur_stream = torch.get_device_module(self.device).current_stream()
+            if (
+                hasattr(forward_batch, "out_cache_loc")
+                and forward_batch.out_cache_loc is not None
+            ):
+                forward_batch.out_cache_loc.record_stream(_cur_stream)
+            if (
+                hasattr(forward_batch, "positions")
+                and forward_batch.positions is not None
+            ):
+                forward_batch.positions.record_stream(_cur_stream)
+
         # Run draft extend batch in the main compute stream
         can_cuda_graph = (
             self.cuda_graph_runner_for_draft_extend
@@ -779,6 +793,28 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     else None
                 ),
             )
+
+        # Record shared attention metadata buffers on default stream to prevent
+        # plan_stream in _draft_extend_for_decode from overwriting them while
+        # the verify forward GPU kernels are still reading them.
+        if self.plan_stream:
+            _cur_stream = torch.get_device_module(self.device).current_stream()
+            _attn = self.target_worker.model_runner.attn_backend
+            for _buf in [
+                getattr(_attn, "kv_indptr", None),
+                getattr(_attn, "qo_indptr", None),
+                getattr(_attn, "qo_indptr_", None),
+                getattr(_attn, "cuda_graph_kv_indices", None),
+                getattr(_attn, "cuda_graph_kv_last_page_len", None),
+                getattr(_attn, "work_metadata", None),
+                getattr(_attn, "work_info_set", None),
+                getattr(_attn, "work_indptr", None),
+                getattr(_attn, "reduce_indptr", None),
+                getattr(_attn, "reduce_final_map", None),
+                getattr(_attn, "reduce_partial_map", None),
+            ]:
+                if _buf is not None and isinstance(_buf, torch.Tensor):
+                    _buf.record_stream(_cur_stream)
 
         # Prepare grammar data on CPU if needed
         if batch.has_grammar:
