@@ -1062,20 +1062,15 @@ class CudaGraphRunner:
             self.capture_hidden_mode = required_capture_hidden_mode
             self.capture()
 
-    def replay_prepare(
-        self,
-        forward_batch: ForwardBatch,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ):
-        buffers = self.buffers
-        self.recapture_if_needed(forward_batch)
+    def _compute_padded_bs(
+        self, raw_bs: int, global_num_tokens_cpu: Optional[List[int]] = None
+    ) -> Optional[int]:
+        """Compute the padded batch size for CUDA graph replay.
 
-        raw_bs = forward_batch.batch_size
-        raw_num_token = raw_bs * self.num_tokens_per_bs
-
-        # Pad
-        if self.require_mlp_tp_gather:
-            max_num_tokens = max(forward_batch.global_num_tokens_cpu)
+        Returns the padded bs, or None if raw_bs exceeds the max captured bs.
+        """
+        if self.require_mlp_tp_gather and global_num_tokens_cpu is not None:
+            max_num_tokens = max(global_num_tokens_cpu)
             max_batch_size = (
                 max_num_tokens / self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
@@ -1085,7 +1080,85 @@ class CudaGraphRunner:
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
         else:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
-        bs = self.capture_bs[index]
+        if index >= len(self.capture_bs):
+            return None
+        return self.capture_bs[index]
+
+    def pre_compute_verify_metadata(
+        self,
+        raw_bs: int,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
+        seq_lens_sum: int,
+        forward_mode,
+        spec_info,
+        global_num_tokens_cpu: Optional[List[int]] = None,
+    ) -> bool:
+        """Pre-compute attention metadata using only draft-independent data.
+
+        This can safely run on plan_stream while draft CUDA graph executes on
+        main_stream, because it only touches seq_lens, req_pool_indices, and
+        constants -- no draft output tensors (input_ids, positions, etc.).
+
+        Call this before replay_prepare(skip_metadata_init=True) to overlap
+        the expensive MLA metadata kernel with draft execution.
+
+        Returns True if metadata was successfully pre-computed, False otherwise.
+        """
+        bs = self._compute_padded_bs(raw_bs, global_num_tokens_cpu)
+        if bs is None:
+            return False
+
+        raw_num_token = raw_bs * self.num_tokens_per_bs
+        buffers = self.buffers
+
+        # Copy draft-independent tensors to graph buffers
+        if bs != raw_bs:
+            buffers.seq_lens.fill_(self.seq_len_fill_value)
+        buffers.req_pool_indices[:raw_bs].copy_(req_pool_indices)
+        buffers.seq_lens[:raw_bs].copy_(seq_lens)
+        if seq_lens_cpu is not None:
+            if bs != raw_bs:
+                buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
+            buffers.seq_lens_cpu[:raw_bs].copy_(seq_lens_cpu)
+
+        # Run the expensive attention metadata kernel (draft-independent)
+        attn_backend = self.model_runner.attn_backend
+        attn_backend.init_forward_metadata_replay_cuda_graph(
+            bs,
+            buffers.req_pool_indices[:bs],
+            buffers.seq_lens[:bs],
+            seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
+            None,  # encoder_lens: not used for TARGET_VERIFY
+            forward_mode,
+            spec_info,
+            seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+        )
+
+        # Store fields so replay_prepare can skip recomputing them
+        self.raw_bs = raw_bs
+        self.raw_num_token = raw_num_token
+        self.bs = bs
+        return True
+
+    def replay_prepare(
+        self,
+        forward_batch: ForwardBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        skip_metadata_init: bool = False,
+    ):
+        buffers = self.buffers
+        self.recapture_if_needed(forward_batch)
+
+        raw_bs = forward_batch.batch_size
+        raw_num_token = raw_bs * self.num_tokens_per_bs
+
+        # Pad
+        bs = self._compute_padded_bs(
+            raw_bs,
+            forward_batch.global_num_tokens_cpu if self.require_mlp_tp_gather else None,
+        )
 
         buffers.populate_from_forward_batch(
             forward_batch=forward_batch,
@@ -1111,21 +1184,22 @@ class CudaGraphRunner:
         if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
             forward_batch.spec_info.custom_mask = buffers.custom_mask
         # Attention backend
-        if self.enable_pdmux:
-            stream_idx = get_current_stream_idx()
-            attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
-        else:
-            attn_backend = self.model_runner.attn_backend
-        attn_backend.init_forward_metadata_replay_cuda_graph(
-            bs,
-            buffers.req_pool_indices[:bs],
-            buffers.seq_lens[:bs],
-            forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
-            buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
-            self.capture_forward_mode,
-            forward_batch.spec_info,
-            seq_lens_cpu=buffers.seq_lens_cpu[:bs],
-        )
+        if not skip_metadata_init:
+            if self.enable_pdmux:
+                stream_idx = get_current_stream_idx()
+                attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
+            else:
+                attn_backend = self.model_runner.attn_backend
+            attn_backend.init_forward_metadata_replay_cuda_graph(
+                bs,
+                buffers.req_pool_indices[:bs],
+                buffers.seq_lens[:bs],
+                forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
+                buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
+                self.capture_forward_mode,
+                forward_batch.spec_info,
+                seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+            )
 
         # Store fields
         self.raw_bs = raw_bs
