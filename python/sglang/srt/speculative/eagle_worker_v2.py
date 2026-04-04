@@ -752,13 +752,21 @@ class EAGLEWorkerV2(BaseSpecWorker):
         bs = len(batch.seq_lens)
 
         # Batch 1: Target verify
-        # Prepare for target verify in a separate stream
+        # Prepare for target verify in a separate stream.
+        # Record an event on main_stream so plan_stream can synchronize
+        # before reading draft-dependent data (draft_token, positions, etc.).
+        plan_sync_event = None
+        if self.plan_stream:
+            plan_sync_event = torch.get_device_module(self.device).Event()
+            plan_sync_event.record()
+
         with self.plan_stream_ctx:
             verify_forward_batch, can_run_cuda_graph = (
                 verify_input.prepare_for_v2_verify(
                     self.req_to_token_pool,
                     batch,
                     self.target_worker,
+                    plan_sync_event=plan_sync_event,
                 )
             )
 

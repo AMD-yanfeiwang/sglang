@@ -1066,6 +1066,7 @@ class CudaGraphRunner:
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        plan_sync_event=None,
     ):
         buffers = self.buffers
         self.recapture_if_needed(forward_batch)
@@ -1086,6 +1087,13 @@ class CudaGraphRunner:
         else:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
+
+        # Wait for main_stream to finish writing draft-dependent data
+        # (draft_token, positions, tree_mask) before D2D copies read them.
+        if plan_sync_event is not None:
+            torch.get_device_module(self.device).current_stream().wait_event(
+                plan_sync_event
+            )
 
         buffers.populate_from_forward_batch(
             forward_batch=forward_batch,

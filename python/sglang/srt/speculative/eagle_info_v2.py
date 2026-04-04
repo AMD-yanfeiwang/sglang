@@ -216,6 +216,7 @@ class EagleVerifyInputV2Mixin:
         req_to_token_pool: ReqToTokenPool,
         batch: ModelWorkerBatch,
         target_worker: TpModelWorker,
+        plan_sync_event=None,
     ):
         if not batch.forward_mode.is_idle():
             # Assign cache locations
@@ -258,9 +259,16 @@ class EagleVerifyInputV2Mixin:
             and target_worker.model_runner.graph_runner.can_run(verify_forward_batch)
         )
         if can_run_cuda_graph:
-            target_worker.model_runner.graph_runner.replay_prepare(verify_forward_batch)
+            target_worker.model_runner.graph_runner.replay_prepare(
+                verify_forward_batch, plan_sync_event=plan_sync_event
+            )
         else:
             if not batch.forward_mode.is_idle():
+                # Wait for main_stream to finish writing draft-dependent data
+                if plan_sync_event is not None:
+                    torch.get_device_module(
+                        batch.input_ids.device
+                    ).current_stream().wait_event(plan_sync_event)
                 target_worker.model_runner.attn_backend.init_forward_metadata(
                     verify_forward_batch
                 )
