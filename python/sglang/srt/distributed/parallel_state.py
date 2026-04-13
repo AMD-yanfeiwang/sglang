@@ -584,18 +584,22 @@ class GroupCoordinator:
                 return input_
 
         outplace_all_reduce_method = None
+        # Prefer QuickReduce for large tensors (e.g. prefill) to avoid
+        # using CA's slower full-precision path for large allreduce ops.
+        # For small tensors (e.g. decode), QR's min_size gate rejects them
+        # and they naturally fall through to CA.
         if (
-            self.ca_comm is not None
-            and not self.ca_comm.disabled
-            and self.ca_comm.should_custom_ar(input_)
-        ):
-            outplace_all_reduce_method = "ca"
-        elif (
             self.qr_comm is not None
             and not self.qr_comm.disabled
             and self.qr_comm.should_quick_allreduce(input_)
         ):
             outplace_all_reduce_method = "qr"
+        elif (
+            self.ca_comm is not None
+            and not self.ca_comm.disabled
+            and self.ca_comm.should_custom_ar(input_)
+        ):
+            outplace_all_reduce_method = "ca"
         elif (
             self.pymscclpp_comm is not None
             and not self.pymscclpp_comm.disabled
