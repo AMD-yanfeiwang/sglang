@@ -5479,6 +5479,18 @@ class ServerArgs:
             help="The expert parallelism size.",
         )
         parser.add_argument(
+            "--dwdp-size",
+            type=int,
+            default=ServerArgs.dwdp_size,
+            help="Distributed Weight Data Parallelism size. When >1, expert weights are distributed across GPUs with async P2P prefetch. Must equal tp_size.",
+        )
+        parser.add_argument(
+            "--dwdp-num-experts-per-worker",
+            type=int,
+            default=ServerArgs.dwdp_num_experts_per_worker,
+            help="Number of experts per worker in DWDP mode. Defaults to num_routed_experts / dwdp_size.",
+        )
+        parser.add_argument(
             "--moe-a2a-backend",
             type=str,
             choices=MOE_A2A_BACKEND_CHOICES,
