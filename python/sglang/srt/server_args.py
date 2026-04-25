@@ -2881,20 +2881,19 @@ class ServerArgs:
         # Auto-force common flags
         self.dp_size = self.dwdp_size
         self.enable_dp_attention = True
+        self.enable_dp_lm_head = True
         self.moe_dense_tp_size = 1
         self.ep_size = self.dwdp_size
         self.moe_dp_size = 1
 
+        # DWDP: no A2A communication needed — each rank has all expert weights
+        self.moe_a2a_backend = "none"
+        self.ep_dispatch_algorithm = "fake"
+
         # Mode-specific
-        if self.disaggregation_mode == "prefill":
-            self.moe_a2a_backend = "none"
-        else:
-            # Hybrid mode
+        if self.disaggregation_mode != "prefill":
+            # Hybrid/standalone mode: disable mixed chunk
             self.enable_mixed_chunk = False
-            if self.moe_a2a_backend == "none":
-                # Default to a real backend for decode
-                # Use "none" for now since decode EP path depends on available backend
-                pass
 
         logger.info(
             f"DWDP enabled: dwdp_size={self.dwdp_size}, dp_size={self.dp_size}, "
