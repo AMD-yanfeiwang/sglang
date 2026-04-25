@@ -456,6 +456,10 @@ class ServerArgs:
     attn_cp_size: int = 1
     moe_dp_size: int = 1
 
+    # DWDP (Distributed Weight Data Parallelism)
+    dwdp_size: int = 1
+    dwdp_num_experts_per_worker: Optional[int] = None
+
     # Multi-node distributed serving
     dist_init_addr: Optional[str] = None
     nnodes: int = 1
@@ -842,6 +846,9 @@ class ServerArgs:
         # Handle Hicache settings.
         self._handle_hicache()
 
+
+        # Handle DWDP (must run BEFORE _handle_data_parallelism).
+        self._handle_dwdp()
         # Handle data parallelism.
         self._handle_data_parallelism()
 
@@ -2851,6 +2858,50 @@ class ServerArgs:
             assert (
                 self.moe_dp_size == 1
             ), "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
+
+    def _handle_dwdp(self):
+        """Handle DWDP configuration. Must run BEFORE _handle_data_parallelism."""
+        if self.dwdp_size <= 1:
+            return
+
+        # Validation
+        assert self.dwdp_size >= 2, (
+            f"dwdp_size must be >= 2 (got {self.dwdp_size})"
+        )
+        assert self.dwdp_size == self.tp_size, (
+            f"dwdp_size ({self.dwdp_size}) must equal tp_size ({self.tp_size})"
+        )
+        assert self.disaggregation_mode != "decode", (
+            "DWDP is not supported for decode-only instances"
+        )
+        assert not self.enable_eplb, (
+            "EPLB is incompatible with DWDP (static expert partitioning)"
+        )
+
+        # Auto-force common flags
+        self.dp_size = self.dwdp_size
+        self.enable_dp_attention = True
+        self.moe_dense_tp_size = 1
+        self.ep_size = self.dwdp_size
+        self.moe_dp_size = 1
+
+        # Mode-specific
+        if self.disaggregation_mode == "prefill":
+            self.moe_a2a_backend = "none"
+        else:
+            # Hybrid mode
+            self.enable_mixed_chunk = False
+            if self.moe_a2a_backend == "none":
+                # Default to a real backend for decode
+                # Use "none" for now since decode EP path depends on available backend
+                pass
+
+        logger.info(
+            f"DWDP enabled: dwdp_size={self.dwdp_size}, dp_size={self.dp_size}, "
+            f"enable_dp_attention=True, moe_dense_tp_size=1, "
+            f"ep_size={self.ep_size}, moe_dp_size=1, "
+            f"moe_a2a_backend={self.moe_a2a_backend}"
+        )
 
     def _handle_data_parallelism(self):
         if self.dp_size == 1:

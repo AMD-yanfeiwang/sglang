@@ -593,9 +593,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.server_args.elastic_ep_backend
             else None
         )
+        # Initialize DWDP manager before model loading (weight registration happens during load)
+        self._init_dwdp_pre_load()
+
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
+
+        # DWDP post-load: exchange IPC handles and init prefetch buffers
+        self._init_dwdp_post_load()
 
         # Load the expert backup client
         self.expert_backup_client = (
@@ -2806,6 +2812,70 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def update_decode_attn_backend(self, stream_idx: int):
         self.decode_attn_backend = self.decode_attn_backend_group[stream_idx]
 
+    def _init_dwdp_pre_load(self):
+        """Create DwdpManager before model loading so weight registration can happen."""
+        if self.server_args.dwdp_size <= 1:
+            return
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info("DWDP: Initializing DwdpManager (pre-load)")
+
+        from sglang.srt.layers.moe.dwdp.dwdp_manager import DwdpManager, set_global_dwdp_manager
+        from sglang.srt.distributed.parallel_state import get_dwdp_rank, get_dwdp_world_size
+
+        dwdp_rank = get_dwdp_rank()
+        dwdp_world_size = get_dwdp_world_size()
+        num_routed_experts = self.model_config.hf_config.n_routed_experts
+        num_experts_per_worker = self.server_args.dwdp_num_experts_per_worker
+        if num_experts_per_worker is None:
+            num_experts_per_worker = num_routed_experts // dwdp_world_size
+
+        # Count MoE layers (for DeepSeek R1: layers 3..60 are MoE)
+        first_k_dense_replace = getattr(self.model_config.hf_config, "first_k_dense_replace", 1)
+        num_hidden_layers = self.model_config.num_hidden_layers
+        moe_layer_freq = getattr(self.model_config.hf_config, "moe_layer_freq", 1)
+        num_moe_layers = sum(
+            1 for i in range(num_hidden_layers)
+            if i >= first_k_dense_replace and (i - first_k_dense_replace) % moe_layer_freq == 0
+        )
+        first_moe_layer_id = first_k_dense_replace
+
+        mgr = DwdpManager(
+            num_routed_experts=num_routed_experts,
+            dwdp_size=dwdp_world_size,
+            dwdp_rank=dwdp_rank,
+            num_moe_layers=num_moe_layers,
+            first_moe_layer_id=first_moe_layer_id,
+            num_experts_per_worker=num_experts_per_worker,
+        )
+        set_global_dwdp_manager(mgr)
+        logger.info(
+            f"DWDP: rank={dwdp_rank}/{dwdp_world_size}, "
+            f"num_routed_experts={num_routed_experts}, "
+            f"experts_per_worker={num_experts_per_worker}, "
+            f"num_moe_layers={num_moe_layers}, "
+            f"first_moe_layer={first_moe_layer_id}"
+        )
+
+    def _init_dwdp_post_load(self):
+        """Exchange IPC handles and init prefetch buffers after model weights are loaded."""
+        from sglang.srt.layers.moe.dwdp.dwdp_manager import get_global_dwdp_manager
+        mgr = get_global_dwdp_manager()
+        if mgr is None:
+            return
+        import logging
+        logger = logging.getLogger(__name__)
+
+        from sglang.srt.distributed.parallel_state import get_dwdp_group
+        dwdp_group = get_dwdp_group()
+
+        logger.info("DWDP: Post-load initialization - exchanging IPC handles")
+        mgr.exchange_ipc_handles(dwdp_group)
+        logger.info("DWDP: Initializing prefetch buffers")
+        mgr.init_prefetch_buffers()
+        mgr.initialize_compute_events()
+        logger.info("DWDP: Post-load initialization complete")
+
     def forward_decode(
         self,
         forward_batch: ForwardBatch,
@@ -2841,6 +2911,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> Tuple[
         Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput], bool
     ]:
+        # DWDP: kick off prefetch for first MoE layers
+        from sglang.srt.layers.moe.dwdp.dwdp_manager import get_global_dwdp_manager
+        dwdp_mgr = get_global_dwdp_manager()
+        if dwdp_mgr is not None:
+            dwdp_mgr.prefetch_first_layers()
+
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors

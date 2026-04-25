@@ -1027,6 +1027,44 @@ class FusedMoE(torch.nn.Module):
 
         return final_hidden_states
 
+
+    def forward_dwdp(self, hidden_states, topk_output, weight_view):
+        """DWDP forward: bypass dispatcher, use multi-B weights directly.
+
+        Args:
+            hidden_states: [num_tokens, hidden_size]
+            topk_output: TopKOutput with all expert IDs in global space
+            weight_view: NvFp4WeightView with multi-B weight tensors
+        """
+        from sglang.srt.layers.moe.token_dispatcher import (
+            StandardCombineInput,
+            StandardDispatchOutput,
+        )
+
+        # Create a StandardDispatchOutput directly (bypass dispatcher.dispatch())
+        dispatch_output = StandardDispatchOutput(
+            hidden_states=hidden_states,
+            hidden_states_scale=None,
+            topk_output=topk_output,
+        )
+
+        # Inject DWDP weight view into the layer for quant_method.apply() to use
+        self._dwdp_weight_view = weight_view
+
+        # Run MoE core (quant_method.apply with multi-B weights)
+        combine_input = self.run_moe_core(dispatch_output=dispatch_output)
+
+        # Clean up
+        self._dwdp_weight_view = None
+
+        origin_hidden_states_dim = hidden_states.shape[-1]
+        final_hidden_states = combine_input.hidden_states
+        final_hidden_states = final_hidden_states[
+            ..., :origin_hidden_states_dim
+        ].contiguous()
+
+        return final_hidden_states
+
     def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
         # TODO: consider using symmetric memory
         return self.quant_method.apply(

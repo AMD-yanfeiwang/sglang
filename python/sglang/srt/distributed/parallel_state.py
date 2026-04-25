@@ -1481,6 +1481,7 @@ def get_attn_cp_group() -> GroupCoordinator:
 _MOE_DP: Optional[GroupCoordinator] = None
 _MOE_EP: Optional[GroupCoordinator] = None
 _MOE_TP: Optional[GroupCoordinator] = None
+_DWDP: Optional[GroupCoordinator] = None
 
 
 def get_moe_dp_group() -> GroupCoordinator:
@@ -1496,6 +1497,26 @@ def get_moe_ep_group() -> GroupCoordinator:
 def get_moe_tp_group() -> GroupCoordinator:
     assert _MOE_TP is not None, "expert model parallel group is not initialized"
     return _MOE_TP
+
+
+
+def get_dwdp_group() -> Optional[GroupCoordinator]:
+    """Get the DWDP process group. Returns None if DWDP is not enabled."""
+    return _DWDP
+
+
+def get_dwdp_rank() -> int:
+    """Get rank within DWDP group. Returns 0 if disabled."""
+    if _DWDP is None:
+        return 0
+    return _DWDP.rank_in_group
+
+
+def get_dwdp_world_size() -> int:
+    """Get DWDP group size. Returns 1 if disabled."""
+    if _DWDP is None:
+        return 1
+    return _DWDP.world_size
 
 
 # kept for backward compatibility
@@ -1977,6 +1998,16 @@ def initialize_model_parallel(
             group_name="moe_tp",
         )
 
+
+    # Build the DWDP (Distributed Weight Data Parallelism) group.
+    # DWDP group is the same as TP group when dwdp_size == tp_size.
+    from sglang.srt.server_args import get_global_server_args
+    _server_args = get_global_server_args()
+    global _DWDP
+    if _server_args is not None and getattr(_server_args, 'dwdp_size', 1) > 1:
+        assert _DWDP is None, "DWDP group is already initialized"
+        _DWDP = _TP  # Reuse TP group since dwdp_size == tp_size
+
     # Build the pipeline model-parallel groups.
     num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
     global _PP
@@ -2199,6 +2230,15 @@ def get_moe_tensor_parallel_rank():
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
+    # DWDP cleanup (may alias _TP, do not destroy separately)
+    global _DWDP
+    from sglang.srt.layers.moe.dwdp.dwdp_manager import get_global_dwdp_manager, set_global_dwdp_manager
+    dwdp_mgr = get_global_dwdp_manager()
+    if dwdp_mgr is not None:
+        dwdp_mgr.cleanup()
+        set_global_dwdp_manager(None)
+    _DWDP = None
+
     global _TP
     if _TP:
         _TP.destroy()

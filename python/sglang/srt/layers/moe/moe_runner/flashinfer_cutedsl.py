@@ -255,6 +255,16 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     # _dummy_run which runs under inference_mode(); inference tensors cannot
     # be inplace-updated during later CUDA graph capture (which runs outside
     # inference_mode), so we must opt out here.
+    # DWDP mode: wrapper sees all experts (since we concatenate multi-B weights)
+    from sglang.srt.layers.moe.dwdp.dwdp_manager import get_global_dwdp_manager
+    dwdp_mgr = get_global_dwdp_manager()
+    if dwdp_mgr is not None:
+        num_local = layer.num_experts  # All experts visible after concat
+        local_offset = 0
+    else:
+        num_local = layer.num_local_experts
+        local_offset = layer.moe_ep_rank * layer.num_local_experts
+
     with torch.inference_mode(False):
         layer._cutedsl_wrapper = CuteDslMoEWrapper(
             num_experts=layer.num_experts,
@@ -263,8 +273,8 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
             intermediate_size=layer.intermediate_size_per_partition,
             use_cuda_graph=use_cuda_graph,
             max_num_tokens=max_num_tokens,
-            num_local_experts=layer.num_local_experts,
-            local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+            num_local_experts=num_local,
+            local_expert_offset=local_offset,
             output_dtype=layer.moe_runner_config.params_dtype,
             device=str(layer.w13_weight.device),
         )
@@ -283,22 +293,26 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
 
 @dataclass
 class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
-    """Quantization payload consumed by FlashInfer CuteDSL FP4 MoE kernels."""
+    """Quantization payload consumed by FlashInfer CuteDSL FP4 MoE kernels.
+
+    For DWDP, weight fields accept Union[Tensor, List[Tensor]] to support
+    multi-B tensor lists from the prefetch buffer.
+    """
 
     # Lazily-created CuteDslMoEWrapper (stashed on layer)
     wrapper: Any
 
-    # Weights (uint8 FP4 packed)
-    w13_weight: torch.Tensor
-    w2_weight: torch.Tensor
+    # Weights (uint8 FP4 packed) — Tensor or List[Tensor] for DWDP multi-B
+    w13_weight: Any  # torch.Tensor or List[torch.Tensor]
+    w2_weight: Any
 
-    # Block-scale factors
-    w13_weight_sf: torch.Tensor
-    w2_weight_sf: torch.Tensor
+    # Block-scale factors — Tensor or List[Tensor] for DWDP multi-B
+    w13_weight_sf: Any
+    w2_weight_sf: Any
 
-    # Per-expert GEMM scales
-    w1_alpha: torch.Tensor
-    w2_alpha: torch.Tensor
+    # Per-expert GEMM scales — Tensor or List[Tensor] for DWDP multi-B
+    w1_alpha: Any
+    w2_alpha: Any
 
     # Intermediate quantization scale (fc2 input)
     fc2_input_scale: torch.Tensor
@@ -336,18 +350,36 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         is_sf_swizzled_layout=False,
     )
 
+    # DWDP multi-B: if weights are List[Tensor], concatenate them for the
+    # kernel.  CuteDslMoEWrapper.run() supports multi-B natively on some
+    # platforms, but we provide a fallback that concatenates along dim 0.
+    w13_weight = quant_info.w13_weight
+    w2_weight = quant_info.w2_weight
+    w13_weight_sf = quant_info.w13_weight_sf
+    w2_weight_sf = quant_info.w2_weight_sf
+    w1_alpha = quant_info.w1_alpha
+    w2_alpha = quant_info.w2_alpha
+
+    if isinstance(w13_weight, (list, tuple)):
+        w13_weight = torch.cat(w13_weight, dim=0)
+        w2_weight = torch.cat(w2_weight, dim=0)
+        w13_weight_sf = torch.cat(w13_weight_sf, dim=0)
+        w2_weight_sf = torch.cat(w2_weight_sf, dim=0)
+        w1_alpha = torch.cat(w1_alpha, dim=0)
+        w2_alpha = torch.cat(w2_alpha, dim=0)
+
     output = quant_info.wrapper.run(
         x=x_fp4,
         x_sf=x_sf,
         token_selected_experts=topk_ids,
         token_final_scales=topk_weights,
-        w1_weight=quant_info.w13_weight,
-        w1_weight_sf=quant_info.w13_weight_sf,
-        w1_alpha=quant_info.w1_alpha,
+        w1_weight=w13_weight,
+        w1_weight_sf=w13_weight_sf,
+        w1_alpha=w1_alpha,
         fc2_input_scale=quant_info.fc2_input_scale,
-        w2_weight=quant_info.w2_weight,
-        w2_weight_sf=quant_info.w2_weight_sf,
-        w2_alpha=quant_info.w2_alpha,
+        w2_weight=w2_weight,
+        w2_weight_sf=w2_weight_sf,
+        w2_alpha=w2_alpha,
     )
 
     return StandardCombineInput(hidden_states=output)

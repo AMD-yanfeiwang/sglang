@@ -1968,6 +1968,22 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     hidden_size=hidden_size,
                 )  # k
 
+        # DWDP: Register weight tensors for IPC handle exchange
+        from sglang.srt.layers.moe.dwdp.dwdp_manager import get_global_dwdp_manager
+        dwdp_mgr = get_global_dwdp_manager()
+        if dwdp_mgr is not None:
+            w13_sf = getattr(layer, "w13_blockscale_mma", getattr(layer, "w13_blockscale_swizzled", None))
+            w2_sf = getattr(layer, "w2_blockscale_mma", getattr(layer, "w2_blockscale_swizzled", None))
+            dwdp_mgr.register_layer_weights(
+                layer_id=layer.layer_id,
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_weight_sf=w13_sf,
+                w2_weight_sf=w2_sf,
+                w1_alpha=layer.g1_alphas,
+                w2_alpha=layer.g2_alphas,
+            )
+
     @property
     def load_up_proj_weight_first(self) -> bool:
         # Load W13 as [Up, Gate] for FlashInfer CUTLASS and CuteDSL v2 kernels.
@@ -2057,23 +2073,40 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             ensure_cutedsl_wrapper(layer)
             w1_alpha, fc2_input_scale, w2_alpha = layer._cutedsl_scales
-            w1_weight_sf = getattr(
-                layer, "w13_blockscale_mma", layer.w13_blockscale_swizzled
-            )
-            w2_weight_sf = getattr(
-                layer, "w2_blockscale_mma", layer.w2_blockscale_swizzled
-            )
-            quant_info = CuteDslFp4MoeQuantInfo(
-                wrapper=layer._cutedsl_wrapper,
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                w13_weight_sf=w1_weight_sf,
-                w2_weight_sf=w2_weight_sf,
-                w1_alpha=w1_alpha,
-                w2_alpha=w2_alpha,
-                fc2_input_scale=fc2_input_scale,
-                input_scale=layer._cutedsl_input_scale,
-            )
+
+            # Check for DWDP multi-B weight view
+            dwdp_weight_view = getattr(layer, '_dwdp_weight_view', None)
+            if dwdp_weight_view is not None:
+                # DWDP mode: use multi-B weight lists from prefetch buffer
+                quant_info = CuteDslFp4MoeQuantInfo(
+                    wrapper=layer._cutedsl_wrapper,
+                    w13_weight=dwdp_weight_view.w13_weights,
+                    w2_weight=dwdp_weight_view.w2_weights,
+                    w13_weight_sf=dwdp_weight_view.w13_weight_sfs,
+                    w2_weight_sf=dwdp_weight_view.w2_weight_sfs,
+                    w1_alpha=dwdp_weight_view.w1_alphas,
+                    w2_alpha=dwdp_weight_view.w2_alphas,
+                    fc2_input_scale=fc2_input_scale,
+                    input_scale=layer._cutedsl_input_scale,
+                )
+            else:
+                w1_weight_sf = getattr(
+                    layer, "w13_blockscale_mma", layer.w13_blockscale_swizzled
+                )
+                w2_weight_sf = getattr(
+                    layer, "w2_blockscale_mma", layer.w2_blockscale_swizzled
+                )
+                quant_info = CuteDslFp4MoeQuantInfo(
+                    wrapper=layer._cutedsl_wrapper,
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    w13_weight_sf=w1_weight_sf,
+                    w2_weight_sf=w2_weight_sf,
+                    w1_alpha=w1_alpha,
+                    w2_alpha=w2_alpha,
+                    fc2_input_scale=fc2_input_scale,
+                    input_scale=layer._cutedsl_input_scale,
+                )
             return self.runner.run(dispatch_output, quant_info)
 
         if self.enable_flashinfer_cutlass_moe:
