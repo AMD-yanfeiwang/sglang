@@ -2080,12 +2080,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 # DWDP mode: use multi-B weight lists from prefetch buffer
                 quant_info = CuteDslFp4MoeQuantInfo(
                     wrapper=layer._cutedsl_wrapper,
-                    w13_weight=dwdp_weight_view.w13_weights,
-                    w2_weight=dwdp_weight_view.w2_weights,
-                    w13_weight_sf=dwdp_weight_view.w13_weight_sfs,
-                    w2_weight_sf=dwdp_weight_view.w2_weight_sfs,
-                    w1_alpha=dwdp_weight_view.w1_alphas,
-                    w2_alpha=dwdp_weight_view.w2_alphas,
+                    w13_weight=dwdp_weight_view.weights["w13_weight"],
+                    w2_weight=dwdp_weight_view.weights["w2_weight"],
+                    w13_weight_sf=dwdp_weight_view.weights["w13_weight_sf"],
+                    w2_weight_sf=dwdp_weight_view.weights["w2_weight_sf"],
+                    w1_alpha=dwdp_weight_view.weights["w1_alpha"],
+                    w2_alpha=dwdp_weight_view.weights["w2_alpha"],
                     fc2_input_scale=fc2_input_scale,
                     input_scale=layer._cutedsl_input_scale,
                 )

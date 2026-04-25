@@ -179,6 +179,18 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             # Weights are stored as torch.uint8 but semantically MXFP4
             layer.dispatcher.set_quant_config({"weight_dtype": torch.float4_e2m1fn_x2})
 
+        # DWDP: Register weight tensors for IPC handle exchange
+        from sglang.srt.layers.moe.dwdp.dwdp_manager import get_global_dwdp_manager
+        dwdp_mgr = get_global_dwdp_manager()
+        if dwdp_mgr is not None:
+            dwdp_mgr.register_layer_weights(
+                layer_id=layer.layer_id,
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_weight_sf=layer.w13_weight_scale,
+                w2_weight_sf=layer.w2_weight_scale,
+            )
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -201,16 +213,34 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
                 torch.float32
             )  # aiter's moe_sorting requires topk_weights to be FP32
 
-        if hasattr(torch, "float4_e2m1fn_x2"):
-            w13_weight = layer.w13_weight.view(torch.float4_e2m1fn_x2)
-            w2_weight = layer.w2_weight.view(torch.float4_e2m1fn_x2)
+        # Check for DWDP multi-B weight view
+        dwdp_weight_view = getattr(layer, "_dwdp_weight_view", None)
+        if dwdp_weight_view is not None:
+            # DWDP mode: concatenate multi-B weights from prefetch buffer
+            w13_weight = torch.cat(dwdp_weight_view.weights["w13_weight"], dim=0)
+            w2_weight = torch.cat(dwdp_weight_view.weights["w2_weight"], dim=0)
+            w13_weight_scale = torch.cat(dwdp_weight_view.weights["w13_weight_sf"], dim=0)
+            w2_weight_scale = torch.cat(dwdp_weight_view.weights["w2_weight_sf"], dim=0)
+            if hasattr(torch, "float4_e2m1fn_x2"):
+                w13_weight = w13_weight.view(torch.float4_e2m1fn_x2)
+                w2_weight = w2_weight.view(torch.float4_e2m1fn_x2)
+            if hasattr(layer.w13_weight, "is_shuffled"):
+                w13_weight.is_shuffled = True
+                w2_weight.is_shuffled = True
+            expert_mask = None  # DWDP handles all experts, no masking
         else:
-            w13_weight = layer.w13_weight
-            w2_weight = layer.w2_weight
-
-        if hasattr(layer.w13_weight, "is_shuffled"):
-            w13_weight.is_shuffled = True
-            w2_weight.is_shuffled = True
+            if hasattr(torch, "float4_e2m1fn_x2"):
+                w13_weight = layer.w13_weight.view(torch.float4_e2m1fn_x2)
+                w2_weight = layer.w2_weight.view(torch.float4_e2m1fn_x2)
+            else:
+                w13_weight = layer.w13_weight
+                w2_weight = layer.w2_weight
+            if hasattr(layer.w13_weight, "is_shuffled"):
+                w13_weight.is_shuffled = True
+                w2_weight.is_shuffled = True
+            w13_weight_scale = layer.w13_weight_scale
+            w2_weight_scale = layer.w2_weight_scale
+            expert_mask = layer.dispatcher.expert_mask_gpu
 
         output = fused_moe(
             x,
@@ -219,14 +249,14 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             topk_weights,
             topk_ids,
             quant_type=QuantType.per_1x32,
-            w1_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
+            w1_scale=w13_weight_scale,
+            w2_scale=w2_weight_scale,
             activation=(
                 ActivationType.Silu
                 if moe_runner_config.activation == "silu"
                 else ActivationType.Gelu
             ),
             doweight_stage1=False,
-            expert_mask=layer.dispatcher.expert_mask_gpu,
+            expert_mask=expert_mask,
         )
         return StandardCombineInput(hidden_states=output)

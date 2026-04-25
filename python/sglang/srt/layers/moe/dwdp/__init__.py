@@ -10,6 +10,7 @@ barriers from the critical path.
 from sglang.srt.layers.moe.dwdp.dwdp_manager import (
     DwdpExpertLayout,
     DwdpManager,
+    DwdpWeightView,
     NvFp4WeightView,
     get_global_dwdp_manager,
     set_global_dwdp_manager,
@@ -20,6 +21,7 @@ __all__ = [
     "DwdpExpertLayout",
     "DwdpManager",
     "DwdpPrefetchBuffer",
+    "DwdpWeightView",
     "NvFp4WeightView",
     "get_global_dwdp_manager",
     "set_global_dwdp_manager",

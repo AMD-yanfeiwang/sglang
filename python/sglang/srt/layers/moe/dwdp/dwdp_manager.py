@@ -97,31 +97,25 @@ class DwdpExpertLayout:
 # NvFp4WeightView  (Multi-B weight tensor bundle)
 # ---------------------------------------------------------------------------
 @dataclass
-class NvFp4WeightView:
-    """Multi-B weight tensor bundle for CuteDSL DWDP forward."""
+@dataclass
+class DwdpWeightView:
+    """Generic multi-B weight tensor bundle for DWDP forward.
 
-    w13_weights: List[torch.Tensor]  # [rank0_tensor, rank1_tensor, ...]
-    w2_weights: List[torch.Tensor]
-    w13_weight_sfs: List[torch.Tensor]
-    w2_weight_sfs: List[torch.Tensor]
-    w1_alphas: List[torch.Tensor]
-    w2_alphas: List[torch.Tensor]
+     maps param_name -> List[Tensor] in rank order.
+    The caller (quant scheme apply method) decides which keys to use.
+    """
+    weights: Dict[str, List[torch.Tensor]]
     expert_size_per_partition: int  # num_experts_per_worker
     slot_start: int  # local_expert_start (global expert ID offset)
+
+
+# Keep alias for backward compatibility
+NvFp4WeightView = DwdpWeightView
 
 
 # ---------------------------------------------------------------------------
 # DwdpLayerHandleCollector
 # ---------------------------------------------------------------------------
-# Weight tensor names tracked for IPC
-DWDP_PARAM_NAMES = [
-    "w13_weight",
-    "w2_weight",
-    "w13_weight_sf",
-    "w2_weight_sf",
-    "w1_alpha",
-    "w2_alpha",
-]
 
 
 class DwdpLayerHandleCollector:
@@ -141,23 +135,16 @@ class DwdpLayerHandleCollector:
         # IPC handles opened on this rank (for cleanup)
         self._opened_handles: List[int] = []
 
-    def register_layer_weights(
-        self,
-        layer_id: int,
-        w13_weight: torch.Tensor,
-        w2_weight: torch.Tensor,
-        w13_weight_sf: torch.Tensor,
-        w2_weight_sf: torch.Tensor,
-        w1_alpha: torch.Tensor,
-        w2_alpha: torch.Tensor,
-    ):
+    def register_layer_weights(self, layer_id: int, **kwargs):
+        """Register weight tensors for a MoE layer.
+        
+        Accepts arbitrary param_name=tensor pairs. Common names:
+        - w13_weight, w2_weight: packed expert weights
+        - w13_weight_sf, w2_weight_sf: block-scale factors
+        - w1_alpha, w2_alpha: per-expert GEMM scales (nvidia FP4)
+        """
         self.local_weights[layer_id] = {
-            "w13_weight": w13_weight,
-            "w2_weight": w2_weight,
-            "w13_weight_sf": w13_weight_sf,
-            "w2_weight_sf": w2_weight_sf,
-            "w1_alpha": w1_alpha,
-            "w2_alpha": w2_alpha,
+            k: v for k, v in kwargs.items() if v is not None
         }
 
     def exchange_ipc_handles(self, dwdp_group):
@@ -385,6 +372,12 @@ class DwdpManager:
         """Initialize double-buffered prefetch system."""
         from sglang.srt.layers.moe.dwdp.prefetch_buffer import DwdpPrefetchBuffer
 
+        if not self.handle_collector.local_weights:
+            logger.warning(
+                f"DWDP rank {self.dwdp_rank}: No MoE layers registered, skipping prefetch buffer init"
+            )
+            return
+
         # Collect param shapes and dtypes from the first registered layer
         first_layer_id = min(self.handle_collector.local_weights.keys())
         param_shapes = {}
@@ -465,52 +458,30 @@ class DwdpManager:
                 wait_compute_layer_idx=moe_layer_idx,
             )
 
-    def get_weight_view(self, layer_id: int) -> NvFp4WeightView:
+    def get_weight_view(self, layer_id: int) -> "DwdpWeightView":
         """Get multi-B weight view for a MoE layer (prefetched + local).
 
-        Returns weight tensors as List[Tensor] in rank order.  For platforms
-        that support multi-B kernel APIs (e.g., FlashInfer CuteDSL on NVIDIA),
-        these lists can be passed directly.  For other platforms, the caller
-        can concatenate them or use them as-is.
+        Returns a DwdpWeightView with per-param-name List[Tensor] in rank order.
+        The caller (quant apply method) decides how to use them (concat, etc.).
         """
         moe_layer_idx = self._layer_id_to_moe_idx(layer_id)
         local_weights = self.handle_collector.local_weights[layer_id]
         buf_idx = moe_layer_idx % 2
+        param_names = list(local_weights.keys())
 
-        # Build weight lists in rank order
-        w13_weights = []
-        w2_weights = []
-        w13_weight_sfs = []
-        w2_weight_sfs = []
-        w1_alphas = []
-        w2_alphas = []
+        # Build weight lists in rank order for each param
+        result = {}  # param_name -> List[Tensor]
+        for pname in param_names:
+            plist = []
+            for rank in range(self.dwdp_size):
+                if rank == self.dwdp_rank:
+                    plist.append(local_weights[pname])
+                else:
+                    plist.append(self.prefetch_buffer.buffers[buf_idx][pname][rank])
+            result[pname] = plist
 
-        for rank in range(self.dwdp_size):
-            if rank == self.dwdp_rank:
-                # Use local weights directly
-                w13_weights.append(local_weights["w13_weight"])
-                w2_weights.append(local_weights["w2_weight"])
-                w13_weight_sfs.append(local_weights["w13_weight_sf"])
-                w2_weight_sfs.append(local_weights["w2_weight_sf"])
-                w1_alphas.append(local_weights["w1_alpha"])
-                w2_alphas.append(local_weights["w2_alpha"])
-            else:
-                # Use prefetch buffer
-                buffers = self.prefetch_buffer.buffers[buf_idx]
-                w13_weights.append(buffers["w13_weight"][rank])
-                w2_weights.append(buffers["w2_weight"][rank])
-                w13_weight_sfs.append(buffers["w13_weight_sf"][rank])
-                w2_weight_sfs.append(buffers["w2_weight_sf"][rank])
-                w1_alphas.append(buffers["w1_alpha"][rank])
-                w2_alphas.append(buffers["w2_alpha"][rank])
-
-        return NvFp4WeightView(
-            w13_weights=w13_weights,
-            w2_weights=w2_weights,
-            w13_weight_sfs=w13_weight_sfs,
-            w2_weight_sfs=w2_weight_sfs,
-            w1_alphas=w1_alphas,
-            w2_alphas=w2_alphas,
+        return DwdpWeightView(
+            weights=result,
             expert_size_per_partition=self.layout.num_experts_per_worker,
             slot_start=self.layout.local_expert_start,
         )
