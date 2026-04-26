@@ -1081,6 +1081,99 @@ class FusedMoE(torch.nn.Module):
 
         return final_hidden_states
 
+    def forward_dwdp(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output,
+        weight_view,
+    ) -> torch.Tensor:
+        """DWDP forward: use assembled multi-rank weight view for all experts.
+
+        In DWDP mode, each rank sees all experts (local + prefetched).
+        We concatenate the weight tensors in expert order, then bypass the
+        standard dispatcher (which remaps to local expert IDs) and directly
+        call the MoE kernel with the full expert set.
+
+        The topk_ids from the gate remain in global expert ID space, which
+        matches the concatenated weight ordering.
+        """
+        from sglang.srt.layers.moe.dwdp.dwdp_manager import DwdpWeightView
+
+        assert isinstance(weight_view, DwdpWeightView)
+
+        # Concatenate weight tensors from all ranks into full expert set
+        full_weights = {}
+        for param_name, tensor_list in weight_view.weights.items():
+            full_weights[param_name] = torch.cat(tensor_list, dim=0)
+
+        # Temporarily swap weights on layer for quant_method.apply_weights.
+        # Concatenate full routed experts (256) with the fused shared expert (if any).
+        saved_attrs = {}
+        for param_name, routed_tensor in full_weights.items():
+            # Handle dotted names like "quant_method.w13_weight" vs flat "w13_weight"
+            parts = param_name.split(".")
+            obj = self
+            for part in parts[:-1]:
+                obj = getattr(obj, part)
+            attr_name = parts[-1]
+            if hasattr(obj, attr_name):
+                original = getattr(obj, attr_name)
+                saved_attrs[(obj, attr_name)] = original
+                # If original has fused shared expert(s) appended, re-append them
+                if self._has_fused_shared and original.shape[0] > self._num_local_routed:
+                    shared_slice = original[self._num_local_routed:]
+                    full_tensor = torch.cat([routed_tensor, shared_slice], dim=0)
+                else:
+                    full_tensor = routed_tensor
+                # Copy custom attributes (e.g. is_shuffled) from original to full tensor
+                for custom_attr in ("is_shuffled",):
+                    if hasattr(original, custom_attr):
+                        setattr(full_tensor, custom_attr, getattr(original, custom_attr))
+                # Bypass nn.Module.__setattr__ which rejects non-Parameter tensors
+                object.__setattr__(obj, attr_name, full_tensor)
+
+        # Save and replace dispatcher's expert mask for DWDP.
+        # Use None to bypass aiter's masking code entirely —
+        # all experts are local in DWDP, no masking needed.
+        saved_expert_mask = None
+        if hasattr(self, "dispatcher") and hasattr(self.dispatcher, "expert_mask_gpu"):
+            saved_expert_mask = self.dispatcher.expert_mask_gpu
+            self.dispatcher.expert_mask_gpu = None
+
+        # Save and replace local expert mapping to use identity (no remapping)
+        saved_local_mapping = None
+        if hasattr(self, "dispatcher") and hasattr(self.dispatcher, "local_expert_mapping"):
+            saved_local_mapping = self.dispatcher.local_expert_mapping
+            self.dispatcher.local_expert_mapping = None
+
+        # Temporarily set EP/TP sizes to 1 so forward_impl:
+        # 1) does NOT recreate local_expert_mapping in dispatch() (moe_ep_size > 1 check)
+        # 2) does NOT all-reduce the output (moe_ep_size > 1 or moe_tp_size > 1 check)
+        saved_layer_ep = self.moe_ep_size
+        saved_layer_tp = self.moe_tp_size
+        saved_disp_ep = getattr(self.dispatcher, "moe_ep_size", None)
+        self.moe_ep_size = 1
+        self.moe_tp_size = 1
+        if saved_disp_ep is not None:
+            self.dispatcher.moe_ep_size = 1
+
+        try:
+            # Use the standard forward_impl path
+            # topk_output.topk_ids are still in global space since we cleared local_expert_mapping
+            return self.forward_impl(hidden_states, topk_output)
+        finally:
+            # Restore original state
+            self.moe_ep_size = saved_layer_ep
+            self.moe_tp_size = saved_layer_tp
+            if saved_disp_ep is not None:
+                self.dispatcher.moe_ep_size = saved_disp_ep
+            for (obj, attr_name), saved_val in saved_attrs.items():
+                object.__setattr__(obj, attr_name, saved_val)
+            if saved_expert_mask is not None:
+                self.dispatcher.expert_mask_gpu = saved_expert_mask
+            if saved_local_mapping is not None:
+                self.dispatcher.local_expert_mapping = saved_local_mapping
+
     def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
         # TODO: consider using symmetric memory
         return self.quant_method.apply(
