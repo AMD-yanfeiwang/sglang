@@ -55,7 +55,7 @@ def _get_memcpy_func():
                 ctypes.c_void_p(dst_ptr),
                 ctypes.c_void_p(src_ptr),
                 ctypes.c_size_t(size_bytes),
-                ctypes.c_int(3),  # hipMemcpyDeviceToDevice
+                ctypes.c_int(4),  # hipMemcpyDefault (cross-GPU IPC)
                 ctypes.c_void_p(stream_ptr),
             )
             if ret != 0:
@@ -222,6 +222,7 @@ class DwdpPrefetchBuffer:
                     total_bytes = self.num_prefetch_experts * expert_bytes
 
                     self._memcpy_async(dst_ptr, src_ptr, total_bytes, stream_ptr)
+
 
             # Signal prefetch completion
             self.prefetch_events[buf_idx][layer_slot].record(self.prefetch_stream)

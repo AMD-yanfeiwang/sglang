@@ -2871,6 +2871,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         logger.info("DWDP: Post-load initialization - exchanging IPC handles")
         mgr.exchange_ipc_handles(dwdp_group)
+
         logger.info("DWDP: Initializing prefetch buffers")
         mgr.init_prefetch_buffers()
         mgr.initialize_compute_events()
@@ -2882,6 +2883,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        # DWDP: kick off prefetch for first MoE layers (same as forward_extend)
+        from sglang.srt.layers.moe.dwdp.dwdp_manager import get_global_dwdp_manager
+        dwdp_mgr = get_global_dwdp_manager()
+        if dwdp_mgr is not None:
+            dwdp_mgr.prefetch_first_layers()
+
         if not skip_attn_backend_init:
             if hasattr(self.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,

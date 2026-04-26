@@ -135,6 +135,9 @@ class DwdpLayerHandleCollector:
         # IPC handles opened on this rank (for cleanup)
         self._opened_handles: List[int] = []
 
+        # Opened IPC storages (prevent GC from closing handles)
+        self._ipc_storages: List[torch.UntypedStorage] = []
+
     def register_layer_weights(self, layer_id: int, **kwargs):
         """Register weight tensors for a MoE layer.
         
@@ -148,161 +151,98 @@ class DwdpLayerHandleCollector:
         }
 
     def exchange_ipc_handles(self, dwdp_group):
-        """Exchange CUDA IPC handles across DWDP group for all registered layers."""
-        try:
-            from cuda import cuda as cuda_driver
-            from cuda import cudart
-        except ImportError:
+        """Exchange CUDA/HIP IPC handles across DWDP group using PyTorch native IPC.
+
+        Uses torch.UntypedStorage._share_cuda_() and _new_shared_cuda() which
+        handle IPC internally in C++ with correct calling conventions.
+        This avoids ctypes ABI issues with hipIpcOpenMemHandle on ROCm.
+        """
+        # Extract raw ProcessGroup from sglang GroupCoordinator wrapper
+        if hasattr(dwdp_group, "cpu_group"):
+            raw_group = dwdp_group.cpu_group
+        else:
+            raw_group = dwdp_group
+
+        if not self.local_weights:
             logger.warning(
-                "cuda-python not available; falling back to hipIPC via ctypes"
+                f"DWDP rank {self.dwdp_rank}: No weights registered, skipping IPC exchange"
             )
-            self._exchange_ipc_handles_hip(dwdp_group)
             return
 
-        for layer_id in sorted(self.local_weights.keys()):
+        # Keep opened storages alive to prevent GC closing the IPC handles
+        self._ipc_storages = []
+
+        sorted_layers = sorted(self.local_weights.keys())
+        logger.info(
+            f"DWDP rank {self.dwdp_rank}: exchanging IPC handles for "
+            f"{len(sorted_layers)} layers via PyTorch native IPC"
+        )
+
+        for layer_idx, layer_id in enumerate(sorted_layers):
+            # Get IPC handles for local weight tensors
             local_handles = {}
             for param_name, tensor in self.local_weights[layer_id].items():
-                err, handle = cudart.cudaIpcGetMemHandle(tensor.data_ptr())
-                if err != cudart.cudaError_t.cudaSuccess:
-                    raise RuntimeError(
-                        f"cudaIpcGetMemHandle failed for layer {layer_id} "
-                        f"{param_name}: {err}"
-                    )
-                err, alloc_base, alloc_size = cuda_driver.cuMemGetAddressRange(
-                    tensor.data_ptr()
-                )
-                offset = tensor.data_ptr() - int(alloc_base)
-                handle_bytes = bytes(handle)
-                local_handles[param_name] = (handle_bytes, offset)
+                storage = tensor.untyped_storage()
+                ipc_tuple = storage._share_cuda_()
+                # ipc_tuple: (device, handle_bytes, size_bytes, offset_bytes,
+                #             ref_counter_handle, ref_counter_offset,
+                #             event_handle, event_sync_required)
+                # Also store tensor metadata for pointer computation
+                local_handles[param_name] = {
+                    "ipc": ipc_tuple,
+                    "storage_offset": tensor.storage_offset(),
+                    "element_size": tensor.element_size(),
+                }
 
             # AllGather handles across DWDP group
             all_handles = [None] * self.dwdp_size
-            dist.all_gather_object(all_handles, local_handles, group=dwdp_group)
+            dist.all_gather_object(all_handles, local_handles, group=raw_group)
 
             # Open peer handles
             for peer_rank in range(self.dwdp_size):
                 if peer_rank == self.dwdp_rank:
                     continue
-                for param_name, (handle_bytes, offset) in all_handles[
-                    peer_rank
-                ].items():
-                    handle = cudart.cudaIpcMemHandle_t()
-                    handle_array = (ctypes.c_char * len(handle_bytes)).from_buffer_copy(
-                        handle_bytes
-                    )
-                    ctypes.memmove(handle.reserved, handle_array, len(handle_bytes))
+                for param_name, info in all_handles[peer_rank].items():
+                    ipc = info["ipc"]
+                    storage_offset = info["storage_offset"]
+                    element_size = info["element_size"]
 
-                    err, base_ptr = cudart.cudaIpcOpenMemHandle(
-                        handle,
-                        cudart.cudaIpcMemLazyEnablePeerAccess,
+                    # Open IPC handle via PyTorch native C++ path
+                    peer_storage = torch.UntypedStorage._new_shared_cuda(
+                        ipc[0],  # device
+                        ipc[1],  # handle_bytes
+                        ipc[2],  # size_bytes
+                        ipc[3],  # offset_bytes
+                        ipc[4],  # ref_counter_handle
+                        ipc[5],  # ref_counter_offset
+                        ipc[6],  # event_handle
+                        ipc[7],  # event_sync_required
                     )
-                    if err != cudart.cudaError_t.cudaSuccess:
-                        raise RuntimeError(
-                            f"cudaIpcOpenMemHandle failed for peer {peer_rank} "
-                            f"layer {layer_id} {param_name}: {err}"
-                        )
-                    self._opened_handles.append(int(base_ptr))
-                    actual_ptr = int(base_ptr) + offset
+                    self._ipc_storages.append(peer_storage)
+
+                    # Compute actual data pointer
+                    base_ptr = peer_storage.data_ptr()
+                    actual_ptr = base_ptr + storage_offset * element_size
                     self.peer_base_ptrs[(peer_rank, layer_id, param_name)] = actual_ptr
 
-    def _exchange_ipc_handles_hip(self, dwdp_group):
-        """Fallback IPC handle exchange using hipIPC via ctypes for AMD/ROCm."""
-        import ctypes
-
-        try:
-            hip = ctypes.CDLL("libamdhip64.so")
-        except OSError:
-            raise RuntimeError("Cannot load libamdhip64.so for hipIPC")
-
-        # hipIpcMemHandle_t is 64 bytes
-        IPC_HANDLE_SIZE = 64
-
-        class hipIpcMemHandle_t(ctypes.Structure):
-            _fields_ = [("reserved", ctypes.c_char * IPC_HANDLE_SIZE)]
-
-        for layer_id in sorted(self.local_weights.keys()):
-            local_handles = {}
-            for param_name, tensor in self.local_weights[layer_id].items():
-                handle = hipIpcMemHandle_t()
-                ret = hip.hipIpcGetMemHandle(
-                    ctypes.byref(handle), ctypes.c_void_p(tensor.data_ptr())
-                )
-                if ret != 0:
-                    raise RuntimeError(
-                        f"hipIpcGetMemHandle failed for layer {layer_id} "
-                        f"{param_name}: error {ret}"
-                    )
-                # For HIP, we need to get the allocation base to compute offset
-                # Use hipPointerGetAttributes
-                class hipPointerAttribute_t(ctypes.Structure):
-                    _fields_ = [
-                        ("memoryType", ctypes.c_int),  # enum
-                        ("device", ctypes.c_int),
-                        ("devicePointer", ctypes.c_void_p),
-                        ("hostPointer", ctypes.c_void_p),
-                        ("isManaged", ctypes.c_int),
-                        ("allocationFlags", ctypes.c_uint),
-                    ]
-
-                # For simplicity, use offset = 0 with direct tensor data_ptr
-                # PyTorch on ROCm typically gives us the exact allocation start
-                # for tensors created via torch.empty
-                handle_bytes = bytes(handle.reserved)
-                offset = 0  # We'll handle offset via tensor slicing
-                local_handles[param_name] = (
-                    handle_bytes,
-                    offset,
-                    tensor.shape,
-                    str(tensor.dtype),
+            if (layer_idx + 1) % 10 == 0 or layer_idx == 0:
+                logger.info(
+                    f"DWDP rank {self.dwdp_rank}: IPC exchange progress "
+                    f"{layer_idx+1}/{len(sorted_layers)} layers, "
+                    f"{len(self.peer_base_ptrs)} peer pointers"
                 )
 
-            all_handles = [None] * self.dwdp_size
-            dist.all_gather_object(all_handles, local_handles, group=dwdp_group)
-
-            for peer_rank in range(self.dwdp_size):
-                if peer_rank == self.dwdp_rank:
-                    continue
-                for param_name, (
-                    handle_bytes,
-                    offset,
-                    shape,
-                    dtype_str,
-                ) in all_handles[peer_rank].items():
-                    handle = hipIpcMemHandle_t()
-                    ctypes.memmove(handle.reserved, handle_bytes, IPC_HANDLE_SIZE)
-
-                    dev_ptr = ctypes.c_void_p()
-                    ret = hip.hipIpcOpenMemHandle(
-                        ctypes.byref(dev_ptr),
-                        handle,
-                        ctypes.c_uint(1),  # hipIpcMemLazyEnablePeerAccess
-                    )
-                    if ret != 0:
-                        raise RuntimeError(
-                            f"hipIpcOpenMemHandle failed for peer {peer_rank} "
-                            f"layer {layer_id} {param_name}: error {ret}"
-                        )
-                    base_ptr = dev_ptr.value
-                    self._opened_handles.append(base_ptr)
-                    actual_ptr = base_ptr + offset
-                    self.peer_base_ptrs[(peer_rank, layer_id, param_name)] = actual_ptr
+        logger.info(
+            f"DWDP rank {self.dwdp_rank}: IPC exchange complete - "
+            f"{len(self.peer_base_ptrs)} peer pointers, "
+            f"{len(self._ipc_storages)} IPC storages opened"
+        )
 
     def cleanup(self):
-        """Close all opened IPC handles."""
-        try:
-            from cuda import cudart
-
-            for ptr in self._opened_handles:
-                cudart.cudaIpcCloseMemHandle(ptr)
-        except ImportError:
-            import ctypes
-
-            try:
-                hip = ctypes.CDLL("libamdhip64.so")
-                for ptr in self._opened_handles:
-                    hip.hipIpcCloseMemHandle(ctypes.c_void_p(ptr))
-            except OSError:
-                pass
+        """Release all IPC resources."""
+        # Clear IPC storages - PyTorch handles closing IPC handles on GC
+        if hasattr(self, "_ipc_storages"):
+            self._ipc_storages.clear()
         self._opened_handles.clear()
         self.peer_base_ptrs.clear()
 

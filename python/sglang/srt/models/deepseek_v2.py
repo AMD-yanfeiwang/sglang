@@ -594,8 +594,15 @@ class DeepseekV2MoE(nn.Module):
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
-        # DWDP check FIRST — before _enable_a2a_moe routing
-        if self._dwdp_enabled and forward_batch is not None and forward_batch.forward_mode.is_extend():
+        # DWDP dispatch: extend/decode use full DWDP path (all 256 experts
+        # via prefetched peer weights), idle returns zeros.
+        if self._dwdp_enabled:
+            if forward_batch is not None and hasattr(forward_batch, 'forward_mode'):
+                if forward_batch.forward_mode.is_idle():
+                    # Idle forward: results discarded, return zeros to avoid
+                    # CK kernel crash with (expert=33, token=1)
+                    return torch.zeros_like(hidden_states)
+            # Both extend and decode use full DWDP path
             return self.forward_dwdp(hidden_states, forward_batch, gemm_output_zero_allocator)
         if not self._enable_a2a_moe:
             if (
@@ -843,6 +850,21 @@ class DeepseekV2MoE(nn.Module):
         # Get weight view
         weight_view = dwdp_manager.get_weight_view(self.layer_id)
 
+        # Debug: one-time check on first call
+        if not hasattr(self, '_dwdp_debug_logged'):
+            self._dwdp_debug_logged = True
+            import logging
+            _logger = logging.getLogger("sglang")
+            for pname, tensors in weight_view.weights.items():
+                nz_counts = []
+                for i, t in enumerate(tensors):
+                    if t is not None:
+                        nz = (t.view(-1)[:100].float().abs().sum().item())
+                        nz_counts.append(f"r{i}:{nz:.2f}")
+                    else:
+                        nz_counts.append(f"r{i}:None")
+                _logger.info(f"DWDP debug layer={self.layer_id} {pname}: {', '.join(nz_counts)}")
+
         # Call FusedMoE.forward_dwdp() — bypasses dispatcher framework
         final_hidden_states = self.experts.forward_dwdp(
             hidden_states, topk_output, weight_view
@@ -856,6 +878,35 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states += shared_output
 
         # NO tensor_model_parallel_all_reduce — each rank is fully independent
+        return final_hidden_states
+
+    def forward_dwdp_local(
+        self,
+        hidden_states: torch.Tensor,
+        gemm_output_zero_allocator=None,
+    ) -> torch.Tensor:
+        """DWDP local-only forward for decode: runs MoE with local experts only.
+        
+        Similar to forward_normal but WITHOUT the tensor_model_parallel_all_reduce
+        since DWDP workers run independently (no TP communication needed in MoE).
+        """
+        if hidden_states.shape[0] > 0:
+            if not self._fuse_shared_experts_inside_sbo:
+                shared_output = self._forward_shared_experts(
+                    hidden_states, gemm_output_zero_allocator
+                )
+            router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+            topk_output = self.topk(hidden_states, router_logits)
+        else:
+            shared_output = None
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
+
+        final_hidden_states = self.experts(hidden_states, topk_output)
+
+        if shared_output is not None:
+            final_hidden_states += shared_output
+
+        # No all-reduce: DWDP workers are independent, no TP communication
         return final_hidden_states
 
     def forward_deepep(
