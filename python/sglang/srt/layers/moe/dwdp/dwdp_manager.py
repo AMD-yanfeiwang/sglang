@@ -143,10 +143,10 @@ class DwdpManager:
         # Prefetch buffers (ping-pong double buffer)
         self._prefetch_buffers: Optional[List[Dict[str, List[Optional[torch.Tensor]]]]] = None
 
-        # CUDA streams and events
-        self._prefetch_stream: Optional[torch.cuda.Stream] = None
-        # Per-layer events: events[buf_idx][layer_slot]
-        self._prefetch_events: Optional[List[List[torch.cuda.Event]]] = None
+        # CUDA streams and events — one stream per peer for parallel D2D copies
+        self._prefetch_streams: Dict[int, torch.cuda.Stream] = {}
+        # Per-layer, per-peer events: events[buf_idx][layer_slot][peer_rank]
+        self._prefetch_events: Optional[List[List[Dict[int, torch.cuda.Event]]]] = None
         self._compute_events: Optional[List[List[torch.cuda.Event]]] = None
 
         self._initialized = False
@@ -266,13 +266,20 @@ class DwdpManager:
                 buffer[param_name] = tensor_list
             self._prefetch_buffers.append(buffer)
 
-        # Create prefetch stream
-        self._prefetch_stream = torch.cuda.Stream(device=device)
+        # Create per-peer prefetch streams (one per peer → parallel SDMA engines)
+        self._prefetch_streams = {}
+        for peer_rank in range(self.dwdp_size):
+            if peer_rank != self.dwdp_rank:
+                self._prefetch_streams[peer_rank] = torch.cuda.Stream(device=device)
 
-        # Create per-layer events for each buffer slot
+        # Create per-layer, per-peer events for each buffer slot
         num_slots_per_buf = math.ceil(self.num_moe_layers / 2)
+        peer_ranks = sorted(self._prefetch_streams.keys())
         self._prefetch_events = [
-            [torch.cuda.Event(enable_timing=False) for _ in range(num_slots_per_buf)]
+            [
+                {pr: torch.cuda.Event(enable_timing=False) for pr in peer_ranks}
+                for _ in range(num_slots_per_buf)
+            ]
             for _ in range(2)
         ]
         self._compute_events = [
@@ -284,7 +291,8 @@ class DwdpManager:
         logger.info(
             f"[DWDP] Prefetch buffers allocated: "
             f"2 x {self.dwdp_size - 1} peers x {num_prefetch} experts, "
-            f"total ~{total_buffer_bytes / 1024**3:.2f} GB"
+            f"total ~{total_buffer_bytes / 1024**3:.2f} GB, "
+            f"{len(self._prefetch_streams)} per-peer streams (multi-stream D2D)"
         )
 
     def initialize_compute_events(self):
@@ -306,7 +314,11 @@ class DwdpManager:
         return layer_id - self.first_moe_layer_id
 
     def _prefetch_layer(self, layer_id: int, wait_compute_layer_id: Optional[int] = None):
-        """Async prefetch peer weights for a single MoE layer into double buffer."""
+        """Async prefetch peer weights for a single MoE layer into double buffer.
+
+        Uses per-peer dedicated streams so D2D copies from different peers
+        execute in parallel on independent SDMA engines.
+        """
         if not self._initialized:
             return
 
@@ -318,20 +330,24 @@ class DwdpManager:
         if weights is None:
             return
 
-        with torch.cuda.stream(self._prefetch_stream):
-            # Wait for compute to release this buffer slot (from 2 layers ago)
-            if wait_compute_layer_id is not None:
-                wait_moe_idx = self._moe_layer_idx(wait_compute_layer_id)
-                wait_buf_idx = wait_moe_idx % 2
-                wait_slot = wait_moe_idx // 2
-                self._prefetch_stream.wait_event(
-                    self._compute_events[wait_buf_idx][wait_slot]
-                )
+        # Precompute wait event (shared by all per-peer streams)
+        wait_event = None
+        if wait_compute_layer_id is not None:
+            wait_moe_idx = self._moe_layer_idx(wait_compute_layer_id)
+            wait_buf_idx = wait_moe_idx % 2
+            wait_slot = wait_moe_idx // 2
+            wait_event = self._compute_events[wait_buf_idx][wait_slot]
 
-            # D2D copy from peer IPC tensors into local buffer
-            for peer_rank in range(self.dwdp_size):
-                if peer_rank == self.dwdp_rank:
-                    continue
+        # Dispatch per-peer copies on per-peer streams (parallel SDMA)
+        for peer_rank in range(self.dwdp_size):
+            if peer_rank == self.dwdp_rank:
+                continue
+
+            stream = self._prefetch_streams[peer_rank]
+            with torch.cuda.stream(stream):
+                # Wait for compute to release this buffer slot (from 2 layers ago)
+                if wait_event is not None:
+                    stream.wait_event(wait_event)
 
                 src_expert_offset = self.layout.get_prefetch_src_offset(peer_rank)
                 num_prefetch = self.layout.num_prefetch_experts
@@ -346,11 +362,11 @@ class DwdpManager:
                     dst_buf = self._prefetch_buffers[buf_idx][param_name][peer_rank]
                     # Slice source tensor: [src_offset:src_offset+num_prefetch, ...]
                     src_slice = peer_tensor.narrow(0, src_expert_offset, num_prefetch)
-                    # Async D2D copy via tensor.copy_() on prefetch stream
+                    # Async D2D copy on this peer's dedicated stream
                     dst_buf.copy_(src_slice, non_blocking=True)
 
-            # Signal prefetch completion
-            self._prefetch_events[buf_idx][layer_slot].record(self._prefetch_stream)
+                # Signal per-peer completion
+                self._prefetch_events[buf_idx][layer_slot][peer_rank].record(stream)
 
     def prefetch_first_layers(self):
         """Trigger async prefetch for the first 2 MoE layers.
@@ -376,6 +392,7 @@ class DwdpManager:
         """Wait for prefetch completion for a given MoE layer.
 
         Called on the default stream before MoE compute.
+        Waits on all per-peer prefetch events for this layer.
         """
         if not self._initialized:
             return
@@ -384,9 +401,9 @@ class DwdpManager:
         buf_idx = moe_idx % 2
         layer_slot = moe_idx // 2
 
-        torch.cuda.current_stream().wait_event(
-            self._prefetch_events[buf_idx][layer_slot]
-        )
+        current_stream = torch.cuda.current_stream()
+        for event in self._prefetch_events[buf_idx][layer_slot].values():
+            current_stream.wait_event(event)
 
     def record_compute_and_prefetch_next(self, layer_id: int):
         """Record compute completion and trigger next layer's prefetch.
@@ -459,7 +476,7 @@ class DwdpManager:
         """Release IPC resources and buffers."""
         self._peer_tensors.clear()
         self._prefetch_buffers = None
-        self._prefetch_stream = None
+        self._prefetch_streams.clear()
         self._prefetch_events = None
         self._compute_events = None
         self._layer_weights.clear()

@@ -657,9 +657,12 @@ class DeepseekV2MoE(nn.Module):
         weight_view = dwdp_mgr.get_weight_view(self.layer_id)
 
         # 5. MoE compute with full expert weights (local + prefetched)
-        final_hidden_states = self.experts.forward_dwdp(
-            hidden_states, topk_output, weight_view
-        )
+        if hidden_states.shape[0] == 0:
+            final_hidden_states = hidden_states
+        else:
+            final_hidden_states = self.experts.forward_dwdp(
+                hidden_states, topk_output, weight_view
+            )
 
         # DWDP scaling: each rank computes the full MoE output, but the
         # EP-mode fused_moe kernel (with aiter expert_mask) internally
