@@ -361,7 +361,7 @@ launch_server_case1() {
     python -m sglang.launch_server \
         --enable-cache-report --enable-metrics \
         --model-path "$MODEL_PATH" \
-        --host 0.0.0.0 \
+        --host 0.0.0.0 --port "$PORT" \
         --tp-size "$TP_SIZE" --page-size "$PAGE_SIZE" \
         "${DP_EP_ARGS[@]}" \
         "$@"
@@ -371,7 +371,7 @@ launch_server_case2() {
     python -m sglang.launch_server \
         --enable-cache-report --enable-metrics \
         --model-path "$MODEL_PATH" \
-        --host 0.0.0.0 \
+        --host 0.0.0.0 --port "$PORT" \
         --tp-size "$TP_SIZE" --page-size "$PAGE_SIZE" \
         "${DP_EP_ARGS[@]}" \
         --enable-hierarchical-cache \
@@ -419,7 +419,7 @@ launch_server_case3() {
     python -m sglang.launch_server \
         --enable-cache-report --enable-metrics \
         --model-path "$MODEL_PATH" \
-        --host 0.0.0.0 \
+        --host 0.0.0.0 --port "$PORT" \
         --tp-size "$TP_SIZE" --page-size "$PAGE_SIZE" \
         "${DP_EP_ARGS[@]}" \
         --enable-hierarchical-cache \
