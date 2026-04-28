@@ -33,7 +33,14 @@ def set_global_dwdp_manager(manager: Optional["DwdpManager"]):
 
 
 def enable_dwdp() -> bool:
-    return _global_dwdp_manager is not None
+    if _global_dwdp_manager is not None:
+        return True
+    try:
+        from sglang.srt.server_args import get_global_server_args
+        args = get_global_server_args()
+        return args is not None and getattr(args, "dwdp_size", 1) > 1
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------

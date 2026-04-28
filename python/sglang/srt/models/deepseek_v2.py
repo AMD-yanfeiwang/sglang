@@ -664,10 +664,8 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states, topk_output, weight_view
             )
 
-        # DWDP scaling: each rank computes the full MoE output, but the
-        # EP-mode fused_moe kernel (with aiter expert_mask) internally
-        # divides by the EP group size. Match this by dividing by dwdp_size.
-        final_hidden_states = final_hidden_states / float(dwdp_mgr.dwdp_size)
+        # No scaling needed: forward_dwdp sets moe_ep_size=1 so the kernel
+        # outputs the raw MoE result without EP-level reduction.
 
         # Apply routed scaling if needed
         if (
