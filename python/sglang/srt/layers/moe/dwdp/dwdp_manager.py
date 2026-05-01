@@ -126,12 +126,15 @@ class DwdpManager:
         num_moe_layers: int,
         first_moe_layer_id: int,
         process_group: Any,  # torch ProcessGroup or GroupCoordinator
+        num_fused_shared_experts: int = 0,
     ):
         self.layout = layout
         self.num_moe_layers = num_moe_layers
         self.first_moe_layer_id = first_moe_layer_id
         self.dwdp_size = layout.dwdp_size
         self.dwdp_rank = layout.dwdp_rank
+        self._num_fused_shared = num_fused_shared_experts
+        self._last_rank = self.dwdp_size - 1
 
         # Extract the raw ProcessGroup for dist.all_gather_object
         if hasattr(process_group, "cpu_group"):
@@ -143,6 +146,12 @@ class DwdpManager:
 
         # Per-layer registered weights: {layer_id: {param_name: Tensor}}
         self._layer_weights: Dict[int, Dict[str, torch.Tensor]] = {}
+
+        # Per-layer shared expert weights: {layer_id: {param_name: Tensor}}
+        self._shared_expert_weights: Dict[int, Dict[str, torch.Tensor]] = {}
+
+        # Pre-fused local tensor (routed+shared) for last rank: {layer_id: {param_name: Tensor}}
+        self._local_fused: Dict[int, Dict[str, torch.Tensor]] = {}
 
         # Peer IPC opened tensors: {(peer_rank, layer_id, param_name): Tensor}
         self._peer_tensors: Dict[Tuple[int, int, str], torch.Tensor] = {}
@@ -178,6 +187,12 @@ class DwdpManager:
             f"[DWDP] Registered weights for layer {layer_id}: "
             f"{list(weights.keys())}"
         )
+
+    def register_shared_expert_weights(
+        self, layer_id: int, weights: Dict[str, torch.Tensor]
+    ):
+        """Register shared expert weight slices for fused-shared-expert mode."""
+        self._shared_expert_weights[layer_id] = weights
 
     # ----- IPC Handle Exchange -----
 
@@ -261,17 +276,40 @@ class DwdpManager:
         for buf_idx in range(2):
             buffer = {}
             for param_name, ref_tensor in first_weights.items():
-                # Buffer shape: (num_prefetch_experts, *per_expert_shape)
                 per_expert_shape = ref_tensor.shape[1:]  # strip expert dim
-                buf_shape = (num_prefetch, *per_expert_shape)
                 tensor_list: List[Optional[torch.Tensor]] = [None] * self.dwdp_size
                 for peer_rank in range(self.dwdp_size):
                     if peer_rank != self.dwdp_rank:
+                        # Last rank buffer includes fused shared expert slot(s)
+                        if peer_rank == self._last_rank and self._num_fused_shared > 0:
+                            buf_shape = (num_prefetch + self._num_fused_shared, *per_expert_shape)
+                        else:
+                            buf_shape = (num_prefetch, *per_expert_shape)
                         t = torch.empty(buf_shape, dtype=ref_tensor.dtype, device=device)
                         tensor_list[peer_rank] = t
                         total_buffer_bytes += t.numel() * t.element_size()
                 buffer[param_name] = tensor_list
             self._prefetch_buffers.append(buffer)
+
+        # Build pre-fused local tensors for the last rank (routed + shared, one-time cat)
+        if self._num_fused_shared > 0 and self.dwdp_rank == self._last_rank:
+            for layer_id in sorted(self._layer_weights.keys()):
+                fused_dict: Dict[str, torch.Tensor] = {}
+                routed_weights = self._layer_weights[layer_id]
+                shared_weights = self._shared_expert_weights.get(layer_id, {})
+                for param_name, routed_tensor in routed_weights.items():
+                    shared_tensor = shared_weights.get(param_name)
+                    if shared_tensor is not None:
+                        fused_dict[param_name] = torch.cat(
+                            [routed_tensor, shared_tensor], dim=0
+                        )
+                    else:
+                        fused_dict[param_name] = routed_tensor
+                self._local_fused[layer_id] = fused_dict
+            logger.info(
+                f"[DWDP] Built {len(self._local_fused)} pre-fused local tensors "
+                f"(routed + {self._num_fused_shared} shared expert)"
+            )
 
         # Create per-peer prefetch streams (one per peer → parallel SDMA engines)
         self._prefetch_streams = {}
@@ -367,10 +405,19 @@ class DwdpManager:
                         continue
 
                     dst_buf = self._prefetch_buffers[buf_idx][param_name][peer_rank]
-                    # Slice source tensor: [src_offset:src_offset+num_prefetch, ...]
                     src_slice = peer_tensor.narrow(0, src_expert_offset, num_prefetch)
-                    # Async D2D copy on this peer's dedicated stream
-                    dst_buf.copy_(src_slice, non_blocking=True)
+
+                    # Last rank with fused shared expert: copy routed into [:num_prefetch],
+                    # then copy local shared expert into the extra slot(s)
+                    if peer_rank == self._last_rank and self._num_fused_shared > 0:
+                        dst_buf.narrow(0, 0, num_prefetch).copy_(src_slice, non_blocking=True)
+                        shared_src = self._shared_expert_weights.get(layer_id, {}).get(param_name)
+                        if shared_src is not None:
+                            dst_buf.narrow(0, num_prefetch, self._num_fused_shared).copy_(
+                                shared_src, non_blocking=True
+                            )
+                    else:
+                        dst_buf.copy_(src_slice, non_blocking=True)
 
                 # Signal per-peer completion
                 self._prefetch_events[buf_idx][layer_slot][peer_rank].record(stream)
@@ -452,12 +499,19 @@ class DwdpManager:
         moe_idx = self._moe_layer_idx(layer_id)
         buf_idx = moe_idx % 2
 
+        local_fused = self._local_fused.get(layer_id, {})
+
         result_weights: Dict[str, List[torch.Tensor]] = {}
         for param_name, local_tensor in local_weights.items():
             tensor_list = []
             for rank in range(self.dwdp_size):
                 if rank == self.dwdp_rank:
-                    tensor_list.append(local_tensor)
+                    # Use pre-fused tensor if this is the last rank with shared expert
+                    fused = local_fused.get(param_name)
+                    if fused is not None:
+                        tensor_list.append(fused)
+                    else:
+                        tensor_list.append(local_tensor)
                 else:
                     if self._prefetch_buffers is not None:
                         buf_tensor = self._prefetch_buffers[buf_idx][param_name][rank]
@@ -487,5 +541,7 @@ class DwdpManager:
         self._prefetch_events = None
         self._compute_events = None
         self._layer_weights.clear()
+        self._shared_expert_weights.clear()
+        self._local_fused.clear()
         self._initialized = False
         logger.info("[DWDP] Cleaned up DWDP resources")

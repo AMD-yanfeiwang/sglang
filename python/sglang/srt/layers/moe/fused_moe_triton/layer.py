@@ -1097,40 +1097,11 @@ class FusedMoE(torch.nn.Module):
 
         assert isinstance(weight_view, DwdpWeightView)
 
-        # Extract weight lists from view
+        # Extract weight lists from view (shared expert already pre-fused by DwdpManager)
         w13_list = weight_view.weights["w13_weight"]
         w2_list = weight_view.weights["w2_weight"]
         w13_scale_list = weight_view.weights.get("w13_weight_scale")
         w2_scale_list = weight_view.weights.get("w2_weight_scale")
-
-        # Handle fused shared expert: append shared expert slice to last partition
-        if self._has_fused_shared:
-            w13_list = list(w13_list)  # copy list
-            w2_list = list(w2_list)
-            if w13_scale_list is not None:
-                w13_scale_list = list(w13_scale_list)
-            if w2_scale_list is not None:
-                w2_scale_list = list(w2_scale_list)
-
-            for param_attr, wlist in [
-                ("w13_weight", w13_list),
-                ("w2_weight", w2_list),
-            ]:
-                original = getattr(self, param_attr, None)
-                if original is not None and original.shape[0] > self._num_local_routed:
-                    shared_slice = original[self._num_local_routed:]
-                    wlist[-1] = torch.cat([wlist[-1], shared_slice], dim=0)
-
-            for scale_attr, slist in [
-                ("w13_weight_scale", w13_scale_list),
-                ("w2_weight_scale", w2_scale_list),
-            ]:
-                if slist is None:
-                    continue
-                original = getattr(self, scale_attr, None)
-                if original is not None and original.shape[0] > self._num_local_routed:
-                    shared_slice = original[self._num_local_routed:]
-                    slist[-1] = torch.cat([slist[-1], shared_slice], dim=0)
 
         # Build dispatch output (bypass dispatcher since no EP remapping needed)
         from sglang.srt.layers.moe.token_dispatcher.standard import (

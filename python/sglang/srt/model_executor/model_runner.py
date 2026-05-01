@@ -1561,11 +1561,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.warning("[DWDP] No MoE layers found, skipping DWDP init")
             return
 
+        # Detect fused shared experts from the first MoE layer
+        num_fused_shared_experts = 0
+        for layer in self.model.model.layers:
+            if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
+                experts = layer.mlp.experts
+                if hasattr(experts, "_has_fused_shared") and experts._has_fused_shared:
+                    num_fused_shared_experts = experts.num_local_experts - experts._num_local_routed
+                break
+
         dwdp_mgr = DwdpManager(
             layout=layout,
             num_moe_layers=num_moe_layers,
             first_moe_layer_id=first_moe_layer_id,
             process_group=tp_group,
+            num_fused_shared_experts=num_fused_shared_experts,
         )
 
         # Register weights from each MoE layer
@@ -1586,6 +1596,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                             weights[name] = param.data
                 if weights:
                     dwdp_mgr.register_layer_weights(layer_id, weights)
+
+                # Register shared expert weight slices separately
+                if num_fused_shared_experts > 0:
+                    shared_weights = {}
+                    for name, param in experts.named_parameters():
+                        if name not in ["correction_bias"] and param.dim() >= 2:
+                            if param.shape[0] > num_local_routed:
+                                shared_weights[name] = param.data[num_local_routed:]
+                    if shared_weights:
+                        dwdp_mgr.register_shared_expert_weights(layer_id, shared_weights)
 
         # Exchange IPC handles and initialize buffers
         dwdp_mgr.exchange_ipc_handles()
