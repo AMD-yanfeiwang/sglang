@@ -114,7 +114,8 @@ def _fwd_grouped_kernel_stage1_rope(
     split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
 
     # apply rotary embedding for q_pe, and k_pe (last token per batch of K_PE)
-    LAST_SPLIT = split_kv_end == cur_batch_seq_len
+    HAS_KV_TOKENS = split_kv_end > split_kv_start
+    LAST_SPLIT = HAS_KV_TOKENS & (split_kv_end == cur_batch_seq_len)
     k_pe_last_token = tl.zeros([BLOCK_R], dtype=q.dtype)
 
     if USE_ROPE:
@@ -183,18 +184,20 @@ def _fwd_grouped_kernel_stage1_rope(
 
         # we only apply to the last token in the K_PE
         if LAST_SPLIT:
-            # debug assert
-            if (cur_batch == 0 and cur_head == 0) and split_kv_id < NUM_KV_SPLITS - 1:
-                tl.device_assert(False, "Only last split should compute k_pe")
-
             kv_loc = tl.load(
                 kv_indices + cur_batch_kv_start_idx + cur_batch_seq_len - 1
             )
             offs_buf_k_pe_last_token = kv_loc * stride_buf_kbs + offs_qk_r
             offs_buf_k_pe_rot_last_token = kv_loc * stride_buf_kbs + offs_qk_rot_r
-            k_pe_last_token = tl.load(K_Buffer + offs_buf_k_pe_last_token)
+            k_pe_last_token = tl.load(
+                K_Buffer + offs_buf_k_pe_last_token, mask=mask_qk_r, other=0.0
+            )
 
-            k_pe_rot_last_token = tl.load(K_Buffer + offs_buf_k_pe_rot_last_token)
+            k_pe_rot_last_token = tl.load(
+                K_Buffer + offs_buf_k_pe_rot_last_token,
+                mask=mask_qk_rot_r,
+                other=0.0,
+            )
             k_pe_rot_last_token = tl.where(
                 mask_rotate, -k_pe_rot_last_token, k_pe_rot_last_token
             )
