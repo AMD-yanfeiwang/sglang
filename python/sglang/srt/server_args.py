@@ -4142,6 +4142,19 @@ class ServerArgs:
             self.enable_mixed_chunk = False
 
     def _handle_other_validations(self):
+<<<<<<< HEAD
+=======
+        if self.dummy_forward:
+            logger.info(
+                "Dummy forward mode enabled: cuda graph, server warmup disabled; "
+                "load format forced to '"'dummy'"'."
+            )
+            self.disable_cuda_graph = True
+            self.skip_server_warmup = True
+            if self.load_format != "dummy":
+                self.load_format = "dummy"
+
+>>>>>>> 2c5ac220f (chore(hicache): trim to UMBP backend scope for upstream PR)
         # Handle model inference tensor dump.
         if self.debug_tensor_dump_output_folder is not None:
             logger.warning(

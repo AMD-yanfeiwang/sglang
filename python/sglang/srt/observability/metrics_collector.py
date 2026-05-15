@@ -1648,26 +1648,10 @@ class StorageMetricsCollector:
             documentation="Number of prefetched prompt tokens.",
             labelnames=labels.keys(),
         )
-        self.prefetched_bytes_total = Counter(
-            name="sglang:prefetched_bytes_total",
-            documentation=(
-                "Logical KV cache bytes prefetched from storage to host "
-                "(aligned with prefetched tokens)."
-            ),
-            labelnames=labels.keys(),
-        )
 
         self.backuped_tokens_total = Counter(
             name="sglang:backuped_tokens_total",
             documentation="Number of backuped tokens.",
-            labelnames=labels.keys(),
-        )
-        self.backuped_bytes_total = Counter(
-            name="sglang:backuped_bytes_total",
-            documentation=(
-                "Logical KV cache bytes backuped from host to storage "
-                "(aligned with backuped tokens)."
-            ),
             labelnames=labels.keys(),
         )
 
@@ -1721,17 +1705,9 @@ class StorageMetricsCollector:
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
 
-    def log_prefetched_bytes(self, prefetched_bytes: int):
-        if prefetched_bytes > 0:
-            self.prefetched_bytes_total.labels(**self.labels).inc(prefetched_bytes)
-
     def log_backuped_tokens(self, backuped_tokens: int):
         if backuped_tokens > 0:
             self.backuped_tokens_total.labels(**self.labels).inc(backuped_tokens)
-
-    def log_backuped_bytes(self, backuped_bytes: int):
-        if backuped_bytes > 0:
-            self.backuped_bytes_total.labels(**self.labels).inc(backuped_bytes)
 
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)
@@ -1833,6 +1809,7 @@ class RadixCacheMetricsCollector:
         self.eviction_num_tokens = Counter(
             name="sglang:evicted_tokens_total",
             documentation="The number of tokens evicted from GPU to CPU.",
+<<<<<<< HEAD
             labelnames=labels.keys(),
         )
         self.eviction_num_bytes = Counter(
@@ -1841,6 +1818,8 @@ class RadixCacheMetricsCollector:
                 "Logical KV cache bytes evicted from GPU to host "
                 "(aligned with evicted tokens)."
             ),
+=======
+>>>>>>> 2c5ac220f (chore(hicache): trim to UMBP backend scope for upstream PR)
             labelnames=labels.keys(),
         )
 
@@ -1856,6 +1835,7 @@ class RadixCacheMetricsCollector:
             documentation="The number of tokens loaded from CPU to GPU.",
             labelnames=labels.keys(),
         )
+<<<<<<< HEAD
         self.load_back_num_bytes = Counter(
             name="sglang:load_back_bytes_total",
             documentation=(
@@ -1911,30 +1891,26 @@ class RadixCacheMetricsCollector:
             labelnames=labels.keys(),
             buckets=bucket_bandwidth_gb_s,
         )
+=======
+>>>>>>> 2c5ac220f (chore(hicache): trim to UMBP backend scope for upstream PR)
 
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
 
+<<<<<<< HEAD
     def increment_eviction_num_bytes(self, num_bytes: int) -> None:
         self.eviction_num_bytes.labels(**self.labels).inc(num_bytes)
 
+=======
+>>>>>>> 2c5ac220f (chore(hicache): trim to UMBP backend scope for upstream PR)
     def increment_load_back_num_tokens(self, num_tokens: int) -> None:
         self.load_back_num_tokens.labels(**self.labels).inc(num_tokens)
-
-    def increment_load_back_num_bytes(self, num_bytes: int) -> None:
-        self.load_back_num_bytes.labels(**self.labels).inc(num_bytes)
 
     def observe_eviction_duration(self, duration_seconds: float) -> None:
         self.eviction_duration_seconds.labels(**self.labels).observe(duration_seconds)
 
     def observe_load_back_duration(self, duration_seconds: float) -> None:
         self.load_back_duration_seconds.labels(**self.labels).observe(duration_seconds)
-
-    def observe_eviction_bandwidth_gb_s(self, bandwidth_gb_s: float) -> None:
-        self.eviction_bandwidth_gb_s.labels(**self.labels).observe(bandwidth_gb_s)
-
-    def observe_load_back_bandwidth_gb_s(self, bandwidth_gb_s: float) -> None:
-        self.load_back_bandwidth_gb_s.labels(**self.labels).observe(bandwidth_gb_s)
 
 
 def get_histogram_conf_from_env(env_var_name: str) -> Optional[List[float]]:

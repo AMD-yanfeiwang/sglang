@@ -77,9 +77,11 @@ class LayerDoneCounter:
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
-        ev = self.events[self.producer_index].finish_event
-        if not ev.query():
-            ev.synchronize()
+        assert self.events[
+            self.producer_index
+        ].finish_event.query(), (
+            "Producer finish event should be ready before being reused."
+        )
         return self.producer_index
 
     def set_consumer(self, index: int):
