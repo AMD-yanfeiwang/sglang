@@ -604,6 +604,8 @@ class Envs:
     # Metrics
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
+    SGLANG_SCHEDULER_METRICS_SEND_HWM = EnvInt(16)
+    SGLANG_SCHEDULER_METRICS_DROP_LOG_INTERVAL = EnvFloat(30.0)
 
     # Tokenizer (Kimi tiktoken: cache all_special_tokens / all_special_ids; the ITL can differ by +10x under high batch size).
     SGLANG_PATCH_TOKENIZER = EnvBool(True)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 import time
 from dataclasses import dataclass
 from typing import (
@@ -12,6 +13,7 @@ from typing import (
 
 import zmq
 
+from sglang.srt.environ import envs
 from sglang.srt.disaggregation.kv_events import (
     EventPublisherFactory,
     KVEventBatch,
@@ -20,6 +22,12 @@ from sglang.srt.disaggregation.kv_events import (
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+
+
+logger = logging.getLogger(__name__)
+SCHEDULER_METRICS_DROP_LOG_INTERVAL = (
+    envs.SGLANG_SCHEDULER_METRICS_DROP_LOG_INTERVAL.get()
+)
 
 
 class SchedulerStats: ...  # type: ignore[no-redef]
@@ -54,6 +62,8 @@ class SchedulerKvEventsPublisher:
     kv_event_publisher: Any = None
 
     def __post_init__(self) -> None:
+        self.dropped_kv_metrics_count = 0
+        self.last_kv_metrics_drop_log = 0.0
         self.init_kv_events(self.kv_events_config)
 
     def init_kv_events(self, kv_events_config: Optional[str]):
@@ -84,8 +94,26 @@ class SchedulerKvEventsPublisher:
             self.ps.dp_rank if self.ps.dp_rank is not None else 0
         )
 
-        if not self.send_metrics_from_scheduler.closed:
-            self.send_metrics_from_scheduler.send_pyobj(kv_metrics)
+        if self.send_metrics_from_scheduler is None:
+            return
+
+        try:
+            if not self.send_metrics_from_scheduler.closed:
+                self.send_metrics_from_scheduler.send_pyobj(
+                    kv_metrics, flags=zmq.NOBLOCK
+                )
+        except zmq.Again:
+            self.dropped_kv_metrics_count += 1
+            now = time.perf_counter()
+            if now >= self.last_kv_metrics_drop_log + SCHEDULER_METRICS_DROP_LOG_INTERVAL:
+                logger.warning(
+                    "Dropped %d scheduler KV metrics updates because the metrics IPC queue is full",
+                    self.dropped_kv_metrics_count,
+                )
+                self.last_kv_metrics_drop_log = now
+                self.dropped_kv_metrics_count = 0
+        except zmq.ZMQError as err:
+            logger.warning("Failed to emit scheduler KV metrics: %s", err)
 
     def publish_kv_events(self):
         if not self.enable_kv_cache_events:

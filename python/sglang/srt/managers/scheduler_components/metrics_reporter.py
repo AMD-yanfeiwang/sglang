@@ -42,6 +42,9 @@ logger = logging.getLogger(__name__)
 RECORD_STEP_TIME = envs.SGLANG_RECORD_STEP_TIME.get()
 LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
+SCHEDULER_METRICS_DROP_LOG_INTERVAL = (
+    envs.SGLANG_SCHEDULER_METRICS_DROP_LOG_INTERVAL.get()
+)
 
 
 @dataclasses.dataclass
@@ -134,6 +137,8 @@ class SchedulerMetricsReporter:
         self.kv_transfer_latency_ms: float = 0.0
 
         self.enable_mfu_metrics = False
+        self.dropped_kv_metrics_count = 0
+        self.last_kv_metrics_drop_log = 0.0
 
         if self.enable_metrics:
             self.enable_mfu_metrics = self.scheduler.server_args.enable_mfu_metrics

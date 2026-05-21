@@ -3,6 +3,7 @@ from typing import Optional
 
 import zmq
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
 from sglang.srt.server_args import PortArgs
 from sglang.srt.utils.network import get_zmq_socket
@@ -58,8 +59,17 @@ class SchedulerIpcChannels:
             send_to_detokenizer = SenderWrapper(None)
 
         if metrics_enabled:
+            metrics_send_hwm = max(1, envs.SGLANG_SCHEDULER_METRICS_SEND_HWM.get())
             send_metrics_from_scheduler = get_zmq_socket(
-                context, zmq.PUSH, port_args.metrics_ipc_name, False
+                context,
+                zmq.PUSH,
+                port_args.metrics_ipc_name,
+                False,
+                socket_options={
+                    zmq.SNDHWM: metrics_send_hwm,
+                    zmq.SNDTIMEO: 0,
+                    zmq.LINGER: 0,
+                },
             )
         else:
             send_metrics_from_scheduler = None

@@ -1809,17 +1809,6 @@ class RadixCacheMetricsCollector:
         self.eviction_num_tokens = Counter(
             name="sglang:evicted_tokens_total",
             documentation="The number of tokens evicted from GPU to CPU.",
-<<<<<<< HEAD
-            labelnames=labels.keys(),
-        )
-        self.eviction_num_bytes = Counter(
-            name="sglang:evicted_bytes_total",
-            documentation=(
-                "Logical KV cache bytes evicted from GPU to host "
-                "(aligned with evicted tokens)."
-            ),
-=======
->>>>>>> 2c5ac220f (chore(hicache): trim to UMBP backend scope for upstream PR)
             labelnames=labels.keys(),
         )
 
@@ -1835,74 +1824,10 @@ class RadixCacheMetricsCollector:
             documentation="The number of tokens loaded from CPU to GPU.",
             labelnames=labels.keys(),
         )
-<<<<<<< HEAD
-        self.load_back_num_bytes = Counter(
-            name="sglang:load_back_bytes_total",
-            documentation=(
-                "Logical KV cache bytes loaded from host to GPU "
-                "(aligned with load-back tokens)."
-            ),
-            labelnames=labels.keys(),
-        )
-        bucket_bandwidth_gb_s = [
-            0.1,
-            0.2,
-            0.5,
-            1,
-            2,
-            5,
-            10,
-            20,
-            40,
-            60,
-            80,
-            100,
-            120,
-            160,
-            200,
-            240,
-            320,
-            400,
-            512,
-            640,
-            768,
-            896,
-            1024,
-            1280,
-            1536,
-            1792,
-            2048,
-        ]
-        self.eviction_bandwidth_gb_s = Histogram(
-            name="sglang:eviction_bandwidth_gb_s",
-            documentation=(
-                "Per-eviction logical KV bandwidth in GB/s "
-                "(evicted logical bytes / eviction duration)."
-            ),
-            labelnames=labels.keys(),
-            buckets=bucket_bandwidth_gb_s,
-        )
-        self.load_back_bandwidth_gb_s = Histogram(
-            name="sglang:load_back_bandwidth_gb_s",
-            documentation=(
-                "Per-load-back logical KV bandwidth in GB/s "
-                "(loaded logical bytes / load-back duration)."
-            ),
-            labelnames=labels.keys(),
-            buckets=bucket_bandwidth_gb_s,
-        )
-=======
->>>>>>> 2c5ac220f (chore(hicache): trim to UMBP backend scope for upstream PR)
 
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
 
-<<<<<<< HEAD
-    def increment_eviction_num_bytes(self, num_bytes: int) -> None:
-        self.eviction_num_bytes.labels(**self.labels).inc(num_bytes)
-
-=======
->>>>>>> 2c5ac220f (chore(hicache): trim to UMBP backend scope for upstream PR)
     def increment_load_back_num_tokens(self, num_tokens: int) -> None:
         self.load_back_num_tokens.labels(**self.labels).inc(num_tokens)
 
