@@ -1,6 +1,10 @@
 import types
 import unittest
+from unittest import mock
 
+from sglang.srt.arg_groups.deepseek_v4_hook import (
+    validate_deepseek_v4_index_cache,
+)
 from sglang.srt.models.deepseek_common.utils import (
     compute_dsv4_index_cache_descriptor,
     compute_dsv4_index_topk_flags,
@@ -119,6 +123,18 @@ class TestDeepseekV4IndexCacheUtils(CustomTestCase):
                 self.assertEqual(len(producers), expected_count)
                 self.assertEqual(
                     dsv4_index_cache_enabled(cfg.compress_ratios, freq), enabled
+                )
+
+    def test_npu_rejects_index_cache_but_preserves_default_path(self):
+        server_args = types.SimpleNamespace(
+            enable_two_batch_overlap=False,
+            pp_size=1,
+        )
+        with mock.patch("sglang.srt.utils.is_npu", return_value=True):
+            validate_deepseek_v4_index_cache(server_args, _hf_config(index_topk_freq=1))
+            with self.assertRaisesRegex(ValueError, "not supported on Ascend/NPU"):
+                validate_deepseek_v4_index_cache(
+                    server_args, _hf_config(index_topk_freq=4)
                 )
 
     def test_pd_compatibility(self):

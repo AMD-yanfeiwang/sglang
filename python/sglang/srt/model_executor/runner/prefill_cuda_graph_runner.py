@@ -1274,6 +1274,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self._init_forward_metadata_for_capture(forward_batch, num_tokens)
 
         def run_once():
+            if self._uses_eager_prefill_tail():
+                attn_backend.init_forward_metadata_in_graph(forward_batch)
             return self._run_forward(forward_batch, num_tokens)
 
         # Main's monolithic BCG runner never invokes

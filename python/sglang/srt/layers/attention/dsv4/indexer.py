@@ -411,15 +411,15 @@ def _transform_raw_c4_indices_to_page_indices_kernel(
     seq_lens,
     page_table,
     out_page_indices,
-    raw_stride_b: tl.constexpr,
-    raw_stride_k: tl.constexpr,
-    seq_lens_stride_b: tl.constexpr,
-    page_table_stride_b: tl.constexpr,
-    page_table_stride_p: tl.constexpr,
-    out_stride_b: tl.constexpr,
-    out_stride_k: tl.constexpr,
+    raw_stride_b,
+    raw_stride_k,
+    seq_lens_stride_b,
+    page_table_stride_b,
+    page_table_stride_p,
+    out_stride_b,
+    out_stride_k,
     topk: tl.constexpr,
-    max_page_idx: tl.constexpr,
+    max_page_idx,
     page_bits: tl.constexpr,
     page_mask: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -454,6 +454,43 @@ def _transform_raw_c4_indices_to_page_indices_kernel(
     )
 
 
+def _validate_raw_c4_index_transform_inputs(
+    raw_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+) -> torch.Tensor:
+    if raw_indices.dim() != 2 or out_page_indices.dim() != 2:
+        raise ValueError(
+            "raw_indices and out_page_indices must be rank-2 tensors, "
+            f"got {raw_indices.shape=} and {out_page_indices.shape=}"
+        )
+    if raw_indices.shape != out_page_indices.shape:
+        raise ValueError(
+            "raw_indices and out_page_indices must have the same shape, "
+            f"got {raw_indices.shape=} and {out_page_indices.shape=}"
+        )
+    if page_table.dim() != 2:
+        raise ValueError(f"page_table must be rank-2, got {page_table.shape=}")
+    if page_size <= 0 or (page_size & (page_size - 1)) != 0:
+        raise ValueError(f"page_size must be a positive power of two, got {page_size}")
+
+    if seq_lens.dim() == 2 and seq_lens.shape[1] == 1:
+        seq_lens = seq_lens.squeeze(-1)
+    if seq_lens.dim() != 1:
+        raise ValueError(
+            f"seq_lens must have shape [batch] or [batch, 1], got {seq_lens.shape}"
+        )
+    if not (raw_indices.shape[0] == seq_lens.shape[0] == page_table.shape[0]):
+        raise ValueError(
+            "raw_indices, seq_lens, and page_table batch dimensions must match, "
+            f"got {raw_indices.shape[0]}, {seq_lens.shape[0]}, "
+            f"and {page_table.shape[0]}"
+        )
+    return seq_lens
+
+
 def transform_raw_c4_indices_to_page_indices_torch(
     raw_indices: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -461,13 +498,14 @@ def transform_raw_c4_indices_to_page_indices_torch(
     out_page_indices: torch.Tensor,
     page_size: int,
 ) -> None:
-    assert raw_indices.shape == out_page_indices.shape
-    assert page_size > 0 and (page_size & (page_size - 1)) == 0
-
-    if seq_lens.dim() == 2:
-        seq_lens = seq_lens.squeeze(-1)
-    assert seq_lens.dim() == 1
-    assert raw_indices.shape[0] == seq_lens.shape[0] == page_table.shape[0]
+    seq_lens = _validate_raw_c4_index_transform_inputs(
+        raw_indices, seq_lens, page_table, out_page_indices, page_size
+    )
+    if raw_indices.numel() == 0:
+        return
+    if page_table.shape[1] == 0:
+        out_page_indices.fill_(-1)
+        return
 
     page_bits = (page_size - 1).bit_length()
     page_mask = page_size - 1
@@ -491,18 +529,16 @@ def transform_raw_c4_indices_to_page_indices_triton(
     out_page_indices: torch.Tensor,
     page_size: int,
 ) -> None:
-    assert raw_indices.shape == out_page_indices.shape
-    assert page_size > 0 and (page_size & (page_size - 1)) == 0
-
-    if seq_lens.dim() == 2:
-        seq_lens = seq_lens.squeeze(-1)
-    assert seq_lens.dim() == 1
-    assert raw_indices.shape[0] == seq_lens.shape[0] == page_table.shape[0]
-
-    topk = raw_indices.shape[1]
-    if topk == 0:
+    seq_lens = _validate_raw_c4_index_transform_inputs(
+        raw_indices, seq_lens, page_table, out_page_indices, page_size
+    )
+    if raw_indices.numel() == 0:
+        return
+    if page_table.shape[1] == 0:
+        out_page_indices.fill_(-1)
         return
 
+    topk = raw_indices.shape[1]
     page_bits = (page_size - 1).bit_length()
     page_mask = page_size - 1
     block = triton.next_power_of_2(topk)
@@ -539,7 +575,6 @@ def transform_raw_c4_indices_to_page_indices(
         and seq_lens.is_cuda
         and page_table.is_cuda
         and out_page_indices.is_cuda
-        and not is_hip()
     ):
         transform_raw_c4_indices_to_page_indices_triton(
             raw_indices,
@@ -850,7 +885,7 @@ class C4IndexerBackendMixin:
             c4_indexer.layer_id
         ].compress_layer_id
         # Sparse prefill consumes the per-layer raw scratch, so synchronize it
-        # with the reused top-k before translating to page indices.
+        # with the reused top-k before translating to page indices when needed.
         num_rows = c4_sparse_page_indices.shape[0]
         raw_indices = self._match_num_queries(prev_topk_indices, num_rows, value=-1)
         if core_metadata.c4_sparse_raw_indices is not None:
@@ -860,13 +895,14 @@ class C4IndexerBackendMixin:
             scratch.copy_(raw_indices)
             raw_indices = scratch
         raw_indices = maybe_capture_indexer_topk(compress_layer_id, raw_indices)
-        transform_raw_c4_indices_to_page_indices(
-            raw_indices,
-            c4_seq_lens,
-            page_table,
-            c4_sparse_page_indices,
-            indexer_metadata.c4_page_size,
-        )
+        if not hisparse_decode:
+            transform_raw_c4_indices_to_page_indices(
+                raw_indices,
+                c4_seq_lens,
+                page_table,
+                c4_sparse_page_indices,
+                indexer_metadata.c4_page_size,
+            )
         self._update_hisparse_c4_sparse_indices(
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
@@ -896,9 +932,6 @@ class C4IndexerBackendMixin:
         if forward_batch.forward_mode.is_idle():
             return None
 
-        # PREP_IN_CG lazy upgrade: this runs from MQALayer._forward_prepare,
-        # before attn_backend.forward() would trigger the upgrade.
-        self.init_forward_metadata_in_graph(forward_batch)
         token_to_kv_pool = self.token_to_kv_pool
 
         if TYPE_CHECKING:

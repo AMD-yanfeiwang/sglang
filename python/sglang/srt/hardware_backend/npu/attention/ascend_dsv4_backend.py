@@ -1030,14 +1030,22 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
         alt_streams=None,
         enable_multi_stream: bool = False,
         q_lora_ready=None,
+        prev_topk_indices: Optional[torch.Tensor] = None,
+        skip_topk: bool = False,
+        return_topk_indices: bool = False,
         skip_compressor: bool = False,
-    ) -> None:
+    ) -> Optional[torch.Tensor]:
+        if prev_topk_indices is not None or skip_topk or return_topk_indices:
+            raise NotImplementedError(
+                "DeepSeek V4 IndexCache is not supported on Ascend/NPU"
+            )
         if forward_batch.forward_mode.is_idle():
-            return
+            return None
         topk_idxs = self.forward_c4_indexer_npu(
             c4_indexer, x, q_lora, forward_batch, skip_compressor=skip_compressor
         )
         self.forward_metadata.c4_topk_indices = topk_idxs
+        return None
 
 
 class DeepseekV4AscendAttnBackend(

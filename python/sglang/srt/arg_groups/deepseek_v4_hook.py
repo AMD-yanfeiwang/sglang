@@ -170,6 +170,16 @@ def validate_deepseek_v4_index_cache(server_args: ServerArgs, hf_config) -> None
     ):
         return
 
+    from sglang.srt.utils import is_npu
+
+    if is_npu():
+        raise ValueError(
+            "DeepSeek V4 IndexCache is not supported on Ascend/NPU: the NPU "
+            "indexer backend does not implement raw top-k reuse. Disable "
+            "IndexCache by setting index_topk_freq=1 and removing shared "
+            "layers from index_topk_pattern."
+        )
+
     if server_args.enable_two_batch_overlap:
         raise ValueError(
             "--enable-two-batch-overlap is not supported with DeepSeek V4 "
