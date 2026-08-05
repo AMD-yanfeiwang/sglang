@@ -30,6 +30,38 @@ _is_hip = is_hip()
 
 ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
 
+# The unified_kv Triton kernels read the unified buffer at the query dtype:
+# ``sparse_attn_v4_paged_prefill`` and the non-quantized
+# ``sparse_attn_v4_paged_decode`` path both reject ``unified_kv.dtype != q.dtype``
+# (and q itself must be fp16/bf16), while the decode fp8 path additionally needs a
+# per-slot ``kv_scales`` tensor that this pool neither owns nor populates. So the
+# unified buffer can only be allocated at a 16-bit float dtype.
+UNIFIED_KV_DTYPES = (torch.bfloat16, torch.float16)
+UNIFIED_KV_FALLBACK_DTYPE = torch.bfloat16
+
+
+def resolve_unified_kv_dtype(kv_cache_dtype: torch.dtype) -> torch.dtype:
+    """Dtype the unified_kv buffers can actually be allocated at.
+
+    ``--kv-cache-dtype fp8_e4m3`` is honored by the *non*-unified DSV4 pools,
+    which pack a token into 584 bytes (nope fp8 + rope bf16 + fp8 scales); see
+    :meth:`DeepSeekV4SingleKVPool.get_bytes_per_token`. The unified buffer has no
+    such packed layout and stays at ``head_dim`` 16-bit = 1024 bytes/token, i.e.
+    1.75x what the flag implies. Routing the request through here keeps that
+    substitution in the log instead of silently dropping the flag on the floor.
+    """
+    if kv_cache_dtype in UNIFIED_KV_DTYPES:
+        return kv_cache_dtype
+    logger.warning(
+        "unified_kv cannot honor kv_cache_dtype=%s: the unified_kv Triton kernels "
+        "require the KV buffer to match the query dtype. Allocating the unified KV "
+        "buffers as %s instead -- KV cache memory and PD-disaggregation transfer "
+        "bytes are 1024 B/token/layer, not the 584 B/token/layer the flag implies.",
+        kv_cache_dtype,
+        UNIFIED_KV_FALLBACK_DTYPE,
+    )
+    return UNIFIED_KV_FALLBACK_DTYPE
+
 
 def get_compress_state_ring_size(
     compress_ratio: int, is_speculative: bool = False
@@ -390,9 +422,12 @@ class DeepSeekV4LayerItem(NamedTuple):
 class DeepSeekV4UnifiedKVPool:
     """
     Layout:
-    unified_kv[L]: ``[swa_pages + padded_compress_rows, head_dim]`` bf16
+    unified_kv[L]: ``[swa_pages + padded_compress_rows, head_dim]`` ``dtype``
     - rows ``[0, swa_pages)``   = SWA ring (``req_pool_indices * swa_window + pos % swa_window``)
     - rows ``[swa_pages, ...)`` = compressed (``swa_pages + page_index``)
+
+    ``dtype`` must come from :func:`resolve_unified_kv_dtype`; the kernels that
+    read these buffers only accept the 16-bit float dtypes it can return.
     """
 
     K_PER_BLOCK = {0: 0, 4: 32, 128: 1}
@@ -406,11 +441,19 @@ class DeepSeekV4UnifiedKVPool:
         page_size: int,
         qk_nope_head_dim: int,
         qk_rope_head_dim: int,
+        dtype: torch.dtype,
         device: str,
         memory_saver_adapter,
         custom_mem_pool,
         swa_ring_size: int,
     ):
+        if dtype not in UNIFIED_KV_DTYPES:
+            raise ValueError(
+                f"unified_kv buffers must be one of {UNIFIED_KV_DTYPES}, got {dtype}. "
+                "Pass resolve_unified_kv_dtype(kv_cache_dtype) rather than the raw "
+                "--kv-cache-dtype value."
+            )
+        self.dtype = dtype
         self.swa_ring_size = swa_ring_size
         self.head_dim = qk_nope_head_dim + qk_rope_head_dim
         self.num_slots = num_slots
@@ -436,7 +479,7 @@ class DeepSeekV4UnifiedKVPool:
                         torch.zeros(
                             self.swa_pages + padded_compress_rows,
                             self.head_dim,
-                            dtype=torch.bfloat16,
+                            dtype=self.dtype,
                             device=device,
                         )
                     )
@@ -588,6 +631,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 page_size=page_size,
                 qk_nope_head_dim=qk_nope_head_dim,
                 qk_rope_head_dim=qk_rope_head_dim,
+                dtype=resolve_unified_kv_dtype(dtype),
                 device=device,
                 memory_saver_adapter=self.memory_saver_adapter,
                 custom_mem_pool=self.custom_mem_pool,
