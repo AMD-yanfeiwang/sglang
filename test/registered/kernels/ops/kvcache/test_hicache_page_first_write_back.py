@@ -283,7 +283,7 @@ def test_page_first_staged_write_back_mla(element_dim: int, page_count: int) -> 
     _run_mla(element_dim, page_count)
 
 
-def test_dsv4_paged_host_pool_staged_roundtrip() -> None:
+def test_dsv4_paged_host_pool_staged_roundtrip(request: pytest.FixtureRequest) -> None:
     page_size = 64
     page_count = 8
     layer_num = 2
@@ -304,6 +304,7 @@ def test_dsv4_paged_host_pool_staged_roundtrip() -> None:
         layout="page_first",
         pin_memory=True,
     )
+    request.addfinalizer(host_pool.destroy)
     assert host_pool.can_use_write_back_jit
 
     host_pages = torch.tensor([0, 1], dtype=torch.int64)
@@ -357,7 +358,7 @@ def test_dsv4_paged_host_pool_staged_roundtrip() -> None:
         assert torch.equal(buffer[mutated_target_pages].cpu(), expected[layer_id])
 
 
-def test_dsv4_state_host_pool_staged_roundtrip() -> None:
+def test_dsv4_state_host_pool_staged_roundtrip(request: pytest.FixtureRequest) -> None:
     swa_page_size = 64
     page_count = 8
     ring_size = 8
@@ -389,6 +390,7 @@ def test_dsv4_state_host_pool_staged_roundtrip() -> None:
         layout="page_first",
         pin_memory=True,
     )
+    request.addfinalizer(host_pool.destroy)
     assert host_pool.can_use_write_back_jit
 
     host_pages = torch.tensor([0, 1], dtype=torch.int64)
@@ -427,7 +429,9 @@ def test_dsv4_state_host_pool_staged_roundtrip() -> None:
         assert torch.equal(page_view[target_pages].cpu(), expected[layer_id])
 
 
-def test_dsv4_dsa_indexer_host_pool_staged_roundtrip() -> None:
+def test_dsv4_dsa_indexer_host_pool_staged_roundtrip(
+    request: pytest.FixtureRequest,
+) -> None:
     page_size = 64
     page_count = 8
     layer_num = 2
@@ -450,12 +454,14 @@ def test_dsv4_dsa_indexer_host_pool_staged_roundtrip() -> None:
         layout="page_first",
         override_kv_cache_dim=device_pool.kv_cache_dim,
     )
+    request.addfinalizer(anchor_host.destroy)
     host_pool = DSAIndexerPoolHost(
         device_pool=device_pool,
         anchor_host=anchor_host,
         layout="page_first",
         pin_memory=True,
     )
+    request.addfinalizer(host_pool.destroy)
     assert host_pool.can_use_write_back_jit
 
     for layer_id, buffer in enumerate(device_pool.index_k_with_scale_buffer):
