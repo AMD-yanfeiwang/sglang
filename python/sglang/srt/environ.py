@@ -1360,6 +1360,10 @@ class Envs:
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
+    # Keep the AITER compressor projection in BF16 and let the fused C4/C128
+    # kernel convert it directly into the configured state and FP32 output.
+    # Runtime routing remains restricted to validated gfx950 decode paths.
+    SGLANG_DSV4_COMPRESSOR_BF16_INPUT = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 
