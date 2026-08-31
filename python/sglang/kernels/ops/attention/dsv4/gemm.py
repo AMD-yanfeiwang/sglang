@@ -24,6 +24,11 @@ _HPC_GEMM_WEIGHT_SCALE = 1.0 / 256.0
 _hpc_gemm_enabled = False
 
 
+def aiter_bf16_projection_available() -> bool:
+    """Whether ``linear_bf16_fp32`` can return AITER's native BF16 result."""
+    return _use_aiter
+
+
 @functools.cache
 def _hpc_gemm_bf16xfp32_available() -> bool:
     """HPC-Ops (https://github.com/Tencent/hpc-ops) ships sm90a kernels."""
@@ -146,9 +151,18 @@ def linear_bf16_fp32(
     y: torch.Tensor,
     *,
     hpc_kernel_min_m: Optional[int] = None,
+    allow_aiter_bf16_output: bool = False,
 ) -> torch.Tensor:
+    """Run the mixed linear, preserving FP32 unless AITER BF16 is opted into.
+
+    ``allow_aiter_bf16_output`` is deliberately narrow: non-AITER paths and an
+    unexpected AITER output dtype still return FP32.
+    """
     if _use_aiter and y.dtype == torch.bfloat16:
-        return tgemm.mm(x, y, otype=x.dtype).float()
+        output = tgemm.mm(x, y, otype=x.dtype)
+        if allow_aiter_bf16_output and output.dtype == torch.bfloat16:
+            return output
+        return output.float()
     elif hpc_kernel_min_m is not None:
         output = _linear_bf16_fp32_hpc(x, y, min_m=hpc_kernel_min_m)
         if output is not None:

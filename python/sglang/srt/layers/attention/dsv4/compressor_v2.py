@@ -12,6 +12,9 @@ from sglang.kernels.ops.attention.dsv4 import (
     compress_norm_rope_store,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsv4.compressor_bf16 import (
+    compressor_backend_allows_bf16_input,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import DSV4Metadata
@@ -211,9 +214,18 @@ class CompressorBackendMixin:
 
         token_to_kv_pool = self.token_to_kv_pool
         token_to_kv_pool = cast("DeepSeekV4TokenToKVPool", token_to_kv_pool)
-        kv_score_input = compressor.compute_kv_score(x, forward_batch)
-
         state_pool = compressor.get_state_pool(self)
+        state_dtype = state_pool.kv_score_buffer.kv_score.dtype
+        if compressor.compressor_bf16_input_enabled and (
+            compressor_backend_allows_bf16_input(state_dtype)
+        ):
+            kv_score_input = compressor.compute_kv_score(
+                x,
+                forward_batch,
+                allow_compressor_bf16_input=True,
+            )
+        else:
+            kv_score_input = compressor.compute_kv_score(x, forward_batch)
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
         )

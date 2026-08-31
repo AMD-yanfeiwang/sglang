@@ -1,24 +1,31 @@
 from __future__ import annotations
 
+import functools
 from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Union
 
 import torch
 import torch.nn as nn
 
 from sglang.kernels.fused_op import BaseFusedOp
-from sglang.kernels.ops.attention.dsv4 import (
-    linear_bf16_fp32,
-    triton_create_paged_compress_data,
-)
+from sglang.kernels.ops.attention.dsv4 import triton_create_paged_compress_data
 from sglang.kernels.ops.attention.dsv4.compress_old import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
     compress_forward,
     compress_fused_norm_rope_inplace,
 )
+from sglang.kernels.ops.attention.dsv4.gemm import (
+    aiter_bf16_projection_available,
+    linear_bf16_fp32,
+)
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+from sglang.srt.layers.attention.dsv4.compressor_bf16 import (
+    can_use_compressor_bf16_projection,
+    compressor_bf16_input_platform_enabled,
+    compressor_mode_allows_bf16_input,
+)
 from sglang.srt.layers.cp.utils import cp_materialize_global_token_order
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -32,10 +39,28 @@ from sglang.srt.mem_cache.deepseek_v4_compress_state import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v2 import _is_hip
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.utils import add_prefix, is_npu, set_weight_attrs
 
 _is_npu = is_npu()
+
+
+@functools.cache
+def _is_gfx950_device(device_index: int) -> bool:
+    if not _is_hip or not torch.cuda.is_available():
+        return False
+    arch = getattr(torch.cuda.get_device_properties(device_index), "gcnArchName", "")
+    return arch.split(":", 1)[0] == "gfx950"
+
+
+def _is_gfx950_tensor(tensor: torch.Tensor) -> bool:
+    if not _is_hip or not tensor.is_cuda:
+        return False
+    device_index = tensor.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return _is_gfx950_device(device_index)
+
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -378,6 +403,18 @@ class Compressor(BaseFusedOp):
         self.freqs_cis = freqs_cis
 
         self.ape_converted = False
+        compressor_bf16_input_flag = envs.SGLANG_DSV4_COMPRESSOR_BF16_INPUT.get()
+        aiter_projection_available = aiter_bf16_projection_available()
+        self.compressor_bf16_input_enabled = (
+            compressor_bf16_input_flag
+            and aiter_projection_available
+            and compressor_mode_allows_bf16_input(
+                self.ratio,
+                use_online_c128=envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get(),
+                use_online_c128_mtp=envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get(),
+                is_disaggregated=get_disagg().disaggregation_mode != "null",
+            )
+        )
 
     def _apply_ape_hotfix(self):
         self.ape_converted = True
@@ -435,14 +472,24 @@ class Compressor(BaseFusedOp):
             kv_score, get_parallel().attn_cp_size, comm_stream, self._pending_key()
         )
 
-    def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
+    def compute_kv_score(
+        self,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        allow_compressor_bf16_input: bool = False,
+    ) -> torch.Tensor:
         if _is_hip:
             pending = getattr(forward_batch, "_cp_pending_gathers", None)
             handle = pending.pop(self._pending_key(), None) if pending else None
             if handle is not None:
                 return cp_all_gather_rerange_finish(handle)
 
-        kv_score = self._compute_wkv_gate(x)
+        kv_score = self._compute_wkv_gate(
+            x,
+            is_decode=forward_batch.forward_mode.is_decode(),
+            allow_compressor_bf16_input=allow_compressor_bf16_input,
+        )
 
         # CUDA path: delegate to backend
         if dsa_use_prefill_cp(forward_batch):
@@ -453,9 +500,39 @@ class Compressor(BaseFusedOp):
             )
         return kv_score
 
-    def _compute_wkv_gate(self, x: torch.Tensor) -> torch.Tensor:
+    def _compute_wkv_gate(
+        self,
+        x: torch.Tensor,
+        *,
+        is_decode: bool = False,
+        allow_compressor_bf16_input: bool = False,
+    ) -> torch.Tensor:
         weight = getattr(self.wkv_gate, "weight", None)
         if weight is not None:
+            if not (self.compressor_bf16_input_enabled and allow_compressor_bf16_input):
+                return linear_bf16_fp32(x, weight)
+            route_enabled = compressor_bf16_input_platform_enabled(
+                flag=True,
+                aiter_available=aiter_bf16_projection_available(),
+                is_gfx950=_is_gfx950_tensor(x),
+            )
+            use_bf16_output = can_use_compressor_bf16_projection(
+                x,
+                weight,
+                enabled=route_enabled,
+                is_decode=is_decode,
+                ratio=self.ratio,
+                is_indexer=self.is_in_indexer,
+                head_dim=self.head_dim,
+                rotate=self.rotate,
+                rope_head_dim=self.rope_head_dim,
+            )
+            if use_bf16_output:
+                return linear_bf16_fp32(
+                    x,
+                    weight,
+                    allow_aiter_bf16_output=True,
+                )
             return linear_bf16_fp32(x, weight)
 
         from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf

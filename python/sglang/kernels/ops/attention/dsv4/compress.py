@@ -78,10 +78,16 @@ def _jit_compress_module(
     dtype_buffer: torch.dtype,
     dtype_in: torch.dtype,
     dtype_out: torch.dtype,
+    dtype_bias: torch.dtype,
     ratio: Literal[4, 128],
 ) -> Module:
     args = make_cpp_args(
-        head_dim, dtype_buffer, dtype_in, dtype_out, is_arch_support_pdl()
+        head_dim,
+        dtype_buffer,
+        dtype_in,
+        dtype_out,
+        dtype_bias,
+        is_arch_support_pdl(),
     )
     kernel_class = f"FlashCompress{ratio}Kernel<{args}>"
     return load_jit(
@@ -390,7 +396,14 @@ def compress_forward(
 ) -> torch.Tensor:
     if out is None:
         num_q_tokens = plan[1].shape[0]  # NOTE: decode = bs, prefill = dynamic
-        out = kv_score_input.new_empty((num_q_tokens, head_dim))
+        # The projected input may stay in BF16, but the compressed activation
+        # remains FP32 for norm/RoPE and cache-store parity with the baseline.
+        out = torch.empty(
+            (num_q_tokens, head_dim),
+            dtype=torch.float32,
+            device=kv_score_input.device,
+        )
+    assert out.dtype == torch.float32, "DSV4 compressed activations must stay FP32"
     assert plan.compress_ratio == compress_ratio
     if is_online:
         assert compress_ratio == 128 and head_dim == 512
@@ -399,9 +412,18 @@ def compress_forward(
         if _is_xpu:
             decode_fn, prefill_fn = _XPU_COMPRESS_FNS[compress_ratio]
         else:
-            dtype_in, dtype_out = kv_score_input.dtype, out.dtype
+            dtype_in, dtype_out, dtype_bias = (
+                kv_score_input.dtype,
+                out.dtype,
+                ape.dtype,
+            )
             module = _jit_compress_module(
-                head_dim, kv_score_buffer.dtype, dtype_in, dtype_out, compress_ratio
+                head_dim,
+                kv_score_buffer.dtype,
+                dtype_in,
+                dtype_out,
+                dtype_bias,
+                compress_ratio,
             )
 
     if _is_xpu:
@@ -409,10 +431,10 @@ def compress_forward(
     else:
         fn = module.decode if plan.is_decode else module.prefill
 
-    # C4/C128 kernels use the same InputFloat type for APE and kv_score_input.
-    # Keep the model parameter in FP32 but convert it to the kernel input dtype
-    # at the fused-kernel boundary.
-    if ape.dtype != kv_score_input.dtype:
+    # XPU and online kernels retain their original coupled input/bias contract.
+    # Offline C4/C128 JIT kernels template APE separately, so BF16 projection
+    # input never downcasts the model's FP32 bias.
+    if (_is_xpu or is_online) and ape.dtype != kv_score_input.dtype:
         ape = ape.to(dtype=kv_score_input.dtype)
     fn(kv_score_buffer, kv_score_input, out, ape, *plan[1:3])
     return out
