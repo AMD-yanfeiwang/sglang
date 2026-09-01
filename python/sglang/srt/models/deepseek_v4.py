@@ -173,6 +173,7 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     get_bool_env_var,
+    get_device,
     is_gfx95_supported,
     is_gfx942_supported,
     is_gfx1250_supported,
@@ -1988,6 +1989,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_sinkhorn_iters,
             self.hc_eps,
         )
+        from sglang.kernels.ops.layernorm.mhc import hc_combine
+
         # y is the post-norm activation fed into the MoE. Allocate it in the
         # symmetric memory pool so the downstream all-reduce uses the low-latency
         # NCCL symmetric path: the Triton inplace MoE runner writes the expert
@@ -1997,7 +2000,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
-            y = (pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(dim=1).to(dtype)
+            y = hc_combine(x_flat, pre.squeeze(1), self.hc_mult, dtype)
         return y, post.squeeze(1), comb.squeeze(1), False
 
     def hc_post(
@@ -3943,6 +3946,21 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         torch.float32,
     ), f"expected fp8_e8m0fnu or float32, got {scale.dtype}"
 
+    # The dequant itself is a trivially parallel elementwise multiply that runs
+    # orders of magnitude faster on the accelerator. Checkpoint tensors are
+    # loaded on the host, so running this on the CPU makes weight loading
+    # CPU-bound and very slow for large models (e.g. DeepSeek-V4). Offload host
+    # tensors to the current accelerator and move the result back to the input
+    # device so downstream weight-loading behavior is unchanged.
+    # get_device() is device-agnostic (CUDA/HIP/NPU/XPU/...) and resolves to the
+    # current rank's device under tensor parallelism; on a CPU-only host it
+    # returns "cpu", making the move a no-op.
+    src_device = weight.device
+    if src_device.type == "cpu":
+        compute_device = get_device()
+        weight = weight.to(compute_device)
+        scale = scale.to(compute_device)
+
     weight_f32 = rearrange(
         weight.float(), "(sn bn) (sk bk) -> sn bn sk bk", bn=128, bk=128
     )
@@ -3950,7 +3968,7 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         weight_f32 * scale.float()[:, None, :, None], "sn bn sk bk -> (sn bn) (sk bk)"
     )
 
-    return result.to(torch.bfloat16)
+    return result.to(device=src_device, dtype=torch.bfloat16)
 
 
 def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
