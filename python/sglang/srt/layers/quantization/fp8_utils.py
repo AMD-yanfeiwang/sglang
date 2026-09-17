@@ -137,10 +137,16 @@ def view_aiter_fused_rms_transposed_fp8_scale(scale: torch.Tensor) -> torch.Tens
     return torch.as_strided(scale, scale.shape, (1, scale.shape[0]))
 
 
-def unshuffle_aiter_fp8_weight(weight: torch.Tensor) -> torch.Tensor:
-    """Undo AITER ``shuffle_weight(..., layout=(16, 16))`` for FP8 weights."""
+def _validate_aiter_fp8_weight_layout(
+    weight: torch.Tensor,
+) -> Tuple[torch.Size, int, int]:
     if weight.element_size() != 1:
-        raise ValueError("AITER FP8 unshuffle requires a one-byte element type")
+        raise ValueError("AITER (16, 16) FP8 layout requires a one-byte element type")
+    if weight.dim() < 2:
+        raise ValueError(
+            "AITER (16, 16) FP8 layout requires at least two dimensions, "
+            f"got {weight.dim()}"
+        )
 
     shape = weight.shape
     n, k = shape[-2:]
@@ -149,6 +155,29 @@ def unshuffle_aiter_fp8_weight(weight: torch.Tensor) -> torch.Tensor:
             "AITER (16, 16) FP8 layout requires N % 16 == 0 and K % 32 == 0, "
             f"got shape {tuple(shape)}"
         )
+    return shape, n, k
+
+
+def shuffle_aiter_fp8_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Apply AITER's ``shuffle_weight(..., layout=(16, 16))`` FP8 layout.
+
+    This is the inverse permutation of :func:`unshuffle_aiter_fp8_weight`.
+    Keeping it in PyTorch lets callers construct a logical submatrix before
+    re-preshuffling it without depending on an AITER import at that call site.
+    """
+    shape, n, k = _validate_aiter_fp8_weight_layout(weight)
+
+    return (
+        weight.reshape(-1, n // 16, 16, k // 32, 2, 16)
+        .permute(0, 1, 3, 4, 2, 5)
+        .contiguous()
+        .reshape(shape)
+    )
+
+
+def unshuffle_aiter_fp8_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Undo AITER ``shuffle_weight(..., layout=(16, 16))`` for FP8 weights."""
+    shape, n, k = _validate_aiter_fp8_weight_layout(weight)
 
     return (
         weight.reshape(-1, n // 16, k // 32, 2, 16, 16)
