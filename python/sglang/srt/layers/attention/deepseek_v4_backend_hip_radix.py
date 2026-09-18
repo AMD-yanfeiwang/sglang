@@ -1516,6 +1516,29 @@ class DeepseekV4HipRadixBackend(
         state_slot = state_slot[:N]
         if core.unified is None:
             core.unified = UnifiedKvMetadata()
+        empty_lengths = torch.zeros_like(core.swa_topk_lengths)
+        hca_lengths = (
+            core.c128_topk_lengths_raw
+            if core.c128_topk_lengths_raw is not None
+            else empty_lengths
+        )
+        csa_lengths = (
+            core.c4_sparse_topk_lengths_raw
+            if core.c4_sparse_topk_lengths_raw is not None
+            else empty_lengths
+        )
+        hca_page_indices = core.c128_page_indices
+        if hca_page_indices is None:
+            hca_page_indices = torch.empty(
+                (N, 0),
+                dtype=torch.int32,
+                device=core.positions_casual.device,
+            )
+        csa_width = (
+            core.c4_sparse_page_indices.shape[1]
+            if core.c4_sparse_page_indices is not None
+            else 0
+        )
         (
             core.unified.swa_indices,
             core.unified.swa_indptr,
@@ -1527,10 +1550,10 @@ class DeepseekV4HipRadixBackend(
             state_slot=state_slot,
             positions=core.positions_casual,
             swa_len=core.swa_topk_lengths,
-            hca_len=core.c128_topk_lengths_raw,
-            csa_len=core.c4_sparse_topk_lengths_raw,
-            hca_page_indices=core.c128_page_indices,
-            csa_width=core.c4_sparse_page_indices.shape[1],
+            hca_len=hca_lengths,
+            csa_len=csa_lengths,
+            hca_page_indices=hca_page_indices,
+            csa_width=csa_width,
             win=pool.unified_swa_window,
             ring_stride=pool.unified_swa_ring_size,
             swa_pages=pool.unified_swa_pages,

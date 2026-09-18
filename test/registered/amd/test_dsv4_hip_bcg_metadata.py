@@ -117,6 +117,47 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         backend.init_forward_metadata_indexer.assert_not_called()
         create_compressor.assert_not_called()
 
+    def test_draft_unified_decode_streams_allow_absent_compression_fields(self):
+        backend = object.__new__(DeepseekV4HipRadixBackend)
+        backend.token_to_kv_pool = SimpleNamespace(
+            unified_swa_window=128,
+            unified_swa_ring_size=128,
+            unified_swa_pages=8,
+        )
+        core = SimpleNamespace(
+            positions_casual=torch.tensor([5], dtype=torch.int32),
+            swa_topk_lengths=torch.tensor([1], dtype=torch.int32),
+            c128_topk_lengths_raw=None,
+            c4_sparse_topk_lengths_raw=None,
+            c128_page_indices=None,
+            c4_sparse_page_indices=None,
+            unified=None,
+        )
+        streams = tuple(torch.tensor([i], dtype=torch.int32) for i in range(6))
+
+        with (
+            mock.patch(
+                "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate."
+                "is_unified_kv_triton",
+                return_value=True,
+            ),
+            mock.patch(
+                "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.runtime."
+                "build_decode_streams",
+                return_value=streams,
+            ) as build_streams,
+        ):
+            backend._attach_unified_kv_decode_streams(
+                core, torch.tensor([2], dtype=torch.int32)
+            )
+
+        kwargs = build_streams.call_args.kwargs
+        self.assertEqual(kwargs["hca_len"].tolist(), [0])
+        self.assertEqual(kwargs["csa_len"].tolist(), [0])
+        self.assertEqual(tuple(kwargs["hca_page_indices"].shape), (1, 0))
+        self.assertEqual(kwargs["csa_width"], 0)
+        self.assertEqual(core.unified.swa_loc.tolist(), [261])
+
     def test_dspark_draft_eager_verify_skips_compression_pools(self):
         backend = object.__new__(DeepseekV4HipRadixBackend)
         backend.is_draft_worker = True
