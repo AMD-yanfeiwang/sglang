@@ -908,7 +908,7 @@ class DeepseekV4HipRadixBackend(
             num_tokens=num_tokens,
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
-            need_compress=True,
+            need_compress=not self.is_draft_worker,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             compress_gpu_plan=ragged_layout is not None,
             extend_start_loc=extend_start_loc,
@@ -922,6 +922,7 @@ class DeepseekV4HipRadixBackend(
         req_pool_indices = raw_metadata.req_pool_indices
         seq_lens = raw_metadata.seq_lens
         out_cache_loc = raw_metadata.out_cache_loc
+        need_compress = not self.is_draft_worker
 
         bs, num_draft_tokens = len(seq_lens), self.target_verify_num_draft_tokens
         seq_lens = seq_lens + num_draft_tokens
@@ -945,7 +946,7 @@ class DeepseekV4HipRadixBackend(
             seq_lens_casual=seq_lens_casual,
             max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
             out_loc=out_cache_loc,
-            need_compress=True,
+            need_compress=need_compress,
         )
         # extend_seq_lens is uniform here (seq_lens already carries the draft
         # block, so the minimum above cannot trim it), hence an exact token count.
@@ -960,20 +961,24 @@ class DeepseekV4HipRadixBackend(
         self._attach_unified_kv_decode_streams(
             core_attn_metadata, req_pool_indices_repeated
         )
-        indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
-        create = functools.partial(
-            create_paged_compressor_data,
-            is_prefill=True,
-            token_to_kv_pool=self.token_to_kv_pool,
-            req_to_token=self.req_to_token,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            extend_lens=extend_seq_lens,
-            seq_lens_cpu=None,
-            extend_lens_cpu=None,
-            use_prefill_cuda_graph=True,
-            num_q_tokens=num_draft_tokens * bs,
-        )
+        if need_compress:
+            indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
+            create = functools.partial(
+                create_paged_compressor_data,
+                is_prefill=True,
+                token_to_kv_pool=self.token_to_kv_pool,
+                req_to_token=self.req_to_token,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                extend_lens=extend_seq_lens,
+                seq_lens_cpu=None,
+                extend_lens_cpu=None,
+                use_prefill_cuda_graph=True,
+                num_q_tokens=num_draft_tokens * bs,
+            )
+        else:
+            indexer_metadata = None
+            create = _create_dummy_paged_compress_data
         return DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
@@ -987,6 +992,7 @@ class DeepseekV4HipRadixBackend(
         req_pool_indices = raw_metadata.req_pool_indices
         seq_lens = raw_metadata.seq_lens
         out_cache_loc = raw_metadata.out_cache_loc
+        need_compress = not self.is_draft_worker
         if self.topk > 0 and self.speculative_num_steps > 1:
             # Each EAGLE draft step appends one token while ForwardBatch keeps
             # the accepted-prefix lengths unchanged across the captured loop.
@@ -998,19 +1004,22 @@ class DeepseekV4HipRadixBackend(
             seq_lens_casual=seq_lens,
             max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
             out_loc=out_cache_loc,
-            need_compress=True,
+            need_compress=need_compress,
         )
         self._attach_unified_kv_decode_streams(core_attn_metadata, req_pool_indices)
-        indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
-
-        create = functools.partial(
-            create_paged_compressor_data,
-            is_prefill=False,
-            token_to_kv_pool=self.token_to_kv_pool,
-            req_to_token=self.req_to_token,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-        )
+        if need_compress:
+            indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
+            create = functools.partial(
+                create_paged_compressor_data,
+                is_prefill=False,
+                token_to_kv_pool=self.token_to_kv_pool,
+                req_to_token=self.req_to_token,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+            )
+        else:
+            indexer_metadata = None
+            create = _create_dummy_paged_compress_data
 
         return DSV4Metadata(
             core_attn_metadata,

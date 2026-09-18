@@ -10,6 +10,8 @@ from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
     DeepseekV4MultiStepBackend,
     DSV4AttnMetadata,
     DSV4Metadata,
+    DSV4RawDecodeMetadata,
+    DSV4RawVerifyMetadata,
     UnifiedKvMetadata,
     _match_num_queries,
 )
@@ -61,6 +63,82 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         )
         self.assertTrue(
             DeepseekV4HipRadixBackend.prefer_eager_mixed_prefill_under_dp_attention
+        )
+
+    def test_dspark_draft_graph_metadata_skips_compression_pools(self):
+        backend = object.__new__(DeepseekV4HipRadixBackend)
+        backend.is_draft_worker = True
+        backend.req_to_token = torch.zeros((1, 8), dtype=torch.int32)
+        backend.MAX_SEQ_LEN_FOR_CAPTURE = 8
+        backend.target_verify_num_draft_tokens = 2
+        backend.topk = 0
+        backend.speculative_num_steps = 0
+        core = object()
+        backend.make_core_attn_metadata = mock.Mock(return_value=core)
+        backend.expand_extend_with_same_length = mock.Mock(
+            return_value=(
+                torch.tensor([3, 3], dtype=torch.int32),
+                torch.tensor([0, 0], dtype=torch.int32),
+            )
+        )
+        backend._attach_unified_kv_prefill_meta = mock.Mock()
+        backend._attach_unified_kv_decode_streams = mock.Mock()
+        backend.init_forward_metadata_indexer = mock.Mock(
+            side_effect=AssertionError("draft owns no compression pool")
+        )
+
+        with mock.patch(
+            "sglang.srt.layers.attention.deepseek_v4_backend_hip_radix."
+            "create_paged_compressor_data"
+        ) as create_compressor:
+            verify_metadata = backend.make_forward_metadata_from_raw_verify(
+                DSV4RawVerifyMetadata(
+                    req_pool_indices=torch.tensor([0], dtype=torch.int32),
+                    seq_lens=torch.tensor([1], dtype=torch.int32),
+                    out_cache_loc=torch.zeros(2, dtype=torch.int64),
+                )
+            )
+            decode_metadata = backend.make_forward_metadata_from_raw_decode(
+                DSV4RawDecodeMetadata(
+                    req_pool_indices=torch.tensor([0], dtype=torch.int32),
+                    seq_lens=torch.tensor([1], dtype=torch.int32),
+                    out_cache_loc=torch.zeros(1, dtype=torch.int64),
+                )
+            )
+
+        for metadata in (verify_metadata, decode_metadata):
+            self.assertIs(metadata.core_attn_metadata, core)
+            self.assertIsNone(metadata.indexer_metadata)
+            self.assertIsNone(metadata.c4_compress_metadata)
+            self.assertIsNone(metadata.c128_compress_metadata)
+        self.assertEqual(backend.make_core_attn_metadata.call_count, 2)
+        for call in backend.make_core_attn_metadata.call_args_list:
+            self.assertFalse(call.kwargs["need_compress"])
+        backend.init_forward_metadata_indexer.assert_not_called()
+        create_compressor.assert_not_called()
+
+    def test_dspark_draft_eager_verify_skips_compression_pools(self):
+        backend = object.__new__(DeepseekV4HipRadixBackend)
+        backend.is_draft_worker = True
+        backend.is_dspark = True
+        backend.target_verify_num_draft_tokens = 2
+        expected = object()
+        backend._move_to_device = mock.Mock(
+            return_value=torch.tensor([2], dtype=torch.int32)
+        )
+        backend.init_forward_metadata_prefill = mock.Mock(return_value=expected)
+
+        result = backend.init_forward_metadata_target_verify_old(
+            max_seq_len=8,
+            req_pool_indices=torch.tensor([0], dtype=torch.int32),
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+            seq_lens_cpu=[1],
+            out_cache_loc=torch.zeros(2, dtype=torch.int64),
+        )
+
+        self.assertIs(result, expected)
+        self.assertFalse(
+            backend.init_forward_metadata_prefill.call_args.kwargs["need_compress"]
         )
 
     def test_non_unified_metadata_matches_underfilled_bucket(self):
