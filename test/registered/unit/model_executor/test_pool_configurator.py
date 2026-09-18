@@ -1251,6 +1251,7 @@ class TestSWAPoolFloor(CustomTestCase):
             page_size=256,
             max_running_requests=2,
             chunked_prefill_size=256,
+            enable_deepseek_v4_fp4_indexer=True,
         )
         cfg = SimpleNamespace(
             qk_nope_head_dim=448,
@@ -1272,7 +1273,10 @@ class TestSWAPoolFloor(CustomTestCase):
             spec_algorithm=spec,
             spec_aux_config=SimpleNamespace(dflash_draft_num_layers=3),
         )
-        planner = DSV4PoolConfigurator(kvc)
+        with patch(
+            "sglang.srt.model_executor.pool_configurator._is_hip", True
+        ):
+            planner = DSV4PoolConfigurator(kvc)
         self.assertEqual(planner.bytes_per_swa_token, 3 * 584)
         budget = 256 * 1024 * 1024
         sizes = planner.calculate_pool_sizes(budget, 256)
