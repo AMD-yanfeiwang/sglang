@@ -1,0 +1,16 @@
+ARG BASE_IMAGE=lmsysorg/sglang-rocm:v0.5.20-rocm724-mi35x-20260918
+FROM ${BASE_IMAGE}
+
+ARG BASE_IMAGE
+ARG SGLANG_REVISION
+ARG SGLANG_PR34200_REVISION
+ARG SGLANG_PR39950_REVISION
+LABEL org.opencontainers.image.base.name="${BASE_IMAGE}" \
+      org.opencontainers.image.revision="${SGLANG_REVISION}" \
+      org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
+      sglang.pr34200.revision="${SGLANG_PR34200_REVISION}" \
+      sglang.pr39950.revision="${SGLANG_PR39950_REVISION}"
+
+RUN rm -rf /sgl-workspace/sglang/.git
+COPY . /sgl-workspace/sglang
+WORKDIR /sgl-workspace/sglang

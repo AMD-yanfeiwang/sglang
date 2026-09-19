@@ -3782,19 +3782,29 @@ def require_mlp_sync():
     return get_parallel().enable_dp_attention or require_gathered_buffer()
 
 
-def get_cuda_graph_batch_size_alignment() -> int:
+def get_cuda_graph_batch_size_alignment(*, align_attn_cp: bool = True) -> int:
     alignment = 1
     if get_exec().overlap.enable_two_batch_overlap:
         alignment *= 2
     if require_gathered_buffer():
         alignment *= get_parallel().attn_tp_size
-    if alignment % get_parallel().attn_cp_size != 0:
+    if align_attn_cp and alignment % get_parallel().attn_cp_size != 0:
         alignment *= get_parallel().attn_cp_size
     return alignment
 
 
-def get_cuda_graph_max_batch_size(max_batch_size: int) -> int:
-    return ceil_align(max_batch_size, get_cuda_graph_batch_size_alignment())
+def should_align_attn_cp_decode_graph() -> bool:
+    parallel = get_parallel()
+    return not (parallel.enable_cp_decode_attn_tp and parallel.attn_cp_size > 1)
+
+
+def get_cuda_graph_max_batch_size(
+    max_batch_size: int, *, align_attn_cp: bool = True
+) -> int:
+    return ceil_align(
+        max_batch_size,
+        get_cuda_graph_batch_size_alignment(align_attn_cp=align_attn_cp),
+    )
 
 
 def get_eager_max_batch_size(max_batch_size: int) -> int:
