@@ -30,7 +30,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import (
     get_cuda_graph_batch_size_alignment,
     get_cuda_graph_max_batch_size,
-    should_align_attn_cp_decode_graph,
 )
 
 if TYPE_CHECKING:
@@ -74,13 +73,7 @@ def get_batch_sizes_to_capture(
     capture_bs = list(get_exec().graph.cuda_graph_config.decode.bs)
     num_max_requests = model_runner.req_to_token_pool.size
 
-    # Decode-attention TP repurposes the CP ranks as ordinary attention-TP
-    # ranks whenever prefill CP is inactive. Decode, draft-decode, and target
-    # verify therefore do not shard token rows across CP ranks and must not
-    # inherit prefill's CP-size token alignment. Keeping it would force DSpark
-    # widths 6 and 7 into request buckets of 4 and 8 respectively.
-    align_attn_cp = should_align_attn_cp_decode_graph()
-    mul_base = get_cuda_graph_batch_size_alignment(align_attn_cp=align_attn_cp)
+    mul_base = get_cuda_graph_batch_size_alignment()
     # TBO splits each request's rows across two micro-batches, so the
     # alignment constraint applies per request rather than per token row.
     alignment_width = captured_req_width
@@ -88,9 +81,7 @@ def get_batch_sizes_to_capture(
         alignment_width = 1
 
     # pad `num_max_requests` to avoid being filtered out
-    num_max_requests = get_cuda_graph_max_batch_size(
-        num_max_requests, align_attn_cp=align_attn_cp
-    )
+    num_max_requests = get_cuda_graph_max_batch_size(num_max_requests)
     if max(capture_bs) > num_max_requests:
         # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
         # is very small. We add more values here to make sure we capture the maximum bs.
