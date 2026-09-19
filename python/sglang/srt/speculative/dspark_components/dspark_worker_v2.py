@@ -471,10 +471,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 # block eagerly from the graph's hidden states instead. Apart
                 # from being the intended precision fallback, skipping the
                 # unused hook avoids paying for two proposal computations.
-                if (
-                    envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
-                    and not self._verify_planner.is_compact_mode
-                ):
+                if envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get():
                     self._draft_sampler = self._maybe_build_draft_sampler(
                         available_memory_gb=available_mem
                     )
@@ -482,11 +479,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                         self.draft_model_runner.capture_tail_hooks.append(
                             make_draft_sampler_capture_hook(self._draft_sampler)
                         )
-                elif envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get() and self.ps.tp_rank == 0:
-                    logger.info(
-                        "DSpark folded proposal is disabled for compact ragged "
-                        "verify; proposal sampling runs eagerly."
-                    )
                 self._proposer.attach_draft_sampler(self._draft_sampler)
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
@@ -749,7 +741,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         draft_tokens = draft_block.draft_tokens
 
         confidence = proposal.confidence
-        if confidence is None and not self._verify_planner.is_verify_all:
+        if confidence is None:
             confidence = self._verify_planner.compute_confidence_tensor(
                 draft_hidden=proposal.draft_hidden,
                 anchor_tokens=draft_block_ids[:, 0],

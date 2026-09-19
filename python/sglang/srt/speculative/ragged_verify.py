@@ -43,38 +43,6 @@ def round_up_grid(total: int, grid: Sequence[int]) -> int:
     return grid[index]
 
 
-def build_ragged_capture_token_buckets(
-    *,
-    request_buckets: Sequence[int],
-    num_tokens_per_req: int,
-    token_alignment: int,
-) -> list[int]:
-    """Build graph tiers for compact verify without whole-request CP padding.
-
-    Static verify graphs need ``bs * num_tokens_per_req`` to satisfy the token
-    alignment, which makes coprime widths expensive (DSpark width 7 under CP8
-    can only capture request batches divisible by 8). Compact verify already
-    carries a ragged per-request layout, so it can capture every aligned token
-    tier instead: 8, 16, 24, ... rather than 56, 112, 168, ...
-    """
-    buckets = sorted(
-        {int(bs) * int(num_tokens_per_req) for bs in request_buckets if int(bs) > 0}
-    )
-    if not buckets:
-        raise ValueError("ragged capture requires at least one request bucket")
-    if num_tokens_per_req < 1:
-        raise ValueError(
-            f"num_tokens_per_req must be positive, got {num_tokens_per_req}"
-        )
-    if token_alignment <= 1:
-        return buckets
-
-    max_tokens = (
-        (buckets[-1] + token_alignment - 1) // token_alignment * token_alignment
-    )
-    return list(range(token_alignment, max_tokens + 1, token_alignment))
-
-
 class RaggedVerifyLayout(msgspec.Struct, frozen=True):
     verify_lens: torch.Tensor
     graph_num_tokens: int

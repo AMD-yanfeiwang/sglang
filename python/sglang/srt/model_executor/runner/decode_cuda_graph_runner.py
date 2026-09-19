@@ -114,14 +114,10 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
-from sglang.srt.speculative.ragged_verify import (
-    build_ragged_capture_token_buckets,
-    resolve_ragged_verify_layout,
-)
+from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
-    get_cuda_graph_batch_size_alignment,
     require_attn_tp_gather,
     require_mlp_tp_gather,
 )
@@ -517,11 +513,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.shared_read_done_event = read_done
 
     def _build_ragged_verify_token_buckets(self) -> list[int]:
-        return build_ragged_capture_token_buckets(
-            request_buckets=self.capture_bs,
-            num_tokens_per_req=self.captured_req_width,
-            token_alignment=get_cuda_graph_batch_size_alignment(),
-        )
+        buckets = sorted({bs * self.captured_req_width for bs in self.capture_bs})
+        assert buckets and buckets[0] > 0, f"{buckets=}"
+        return buckets
 
     def _autotune_buffers(self):
         """Reuse these static decode buffers (sized to max_bs) for the warmup
