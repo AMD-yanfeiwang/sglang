@@ -559,13 +559,17 @@ class TestVerifyAllConfidence(CustomTestCase):
         planner = DSparkVerifyPlanner.__new__(DSparkVerifyPlanner)
         planner._confidence_head = object()
         planner._is_verify_all = True
+        planner._budget_planner = object()
         self.assertTrue(planner.carries_confidence)
+        self.assertFalse(planner.schedules_verify_budget)
         self.assertFalse(planner.needs_confidence)
 
     def test_dynamic_schedule_keeps_confidence(self):
         planner = DSparkVerifyPlanner.__new__(DSparkVerifyPlanner)
         planner._confidence_head = object()
         planner._is_verify_all = False
+        planner._budget_planner = object()
+        self.assertTrue(planner.schedules_verify_budget)
         self.assertTrue(planner.needs_confidence)
 
 

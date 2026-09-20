@@ -216,7 +216,7 @@ class DSparkVerifyPlanner:
         Compact mode with an uninitialized SPS table is verify-all: its layout
         is uniform and returned before the confidence scheduler runs.
         """
-        return self.carries_confidence and not self._is_verify_all
+        return self.carries_confidence and self.schedules_verify_budget
 
     @property
     def last_confidence_raw(self) -> Optional[torch.Tensor]:
@@ -226,7 +226,7 @@ class DSparkVerifyPlanner:
 
     @property
     def schedules_verify_budget(self) -> bool:
-        return self._budget_planner is not None
+        return self._budget_planner is not None and not self._is_verify_all
 
     @property
     def is_compact_mode(self) -> bool:
