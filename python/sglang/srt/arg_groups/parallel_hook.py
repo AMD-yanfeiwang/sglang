@@ -661,7 +661,12 @@ def validate_prefill_cp_platform(server_args: Any):
     """Reject deprecated platform CP before resolving models or CP topology."""
     cfg = resolving_view(server_args)
     platform = get_platform()
-    if cfg.enable_prefill_cp and (platform.is_hip or platform.is_musa):
+    allow_deprecated_hip_cp = (
+        os.environ.get("SGLANG_ALLOW_DEPRECATED_HIP_PREFILL_CP", "0") == "1"
+    )
+    if cfg.enable_prefill_cp and (
+        platform.is_musa or (platform.is_hip and not allow_deprecated_hip_cp)
+    ):
         raise ValueError(
             "Prefill CP on HIP/MUSA is deprecated; CP support will be refactored soon."
         )
