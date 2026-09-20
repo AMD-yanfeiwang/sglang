@@ -5,6 +5,7 @@ wheels (sgl_kernel) at module scope, which fail to import on CPU runners.
 """
 
 import unittest
+from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -37,6 +38,98 @@ class TestRaggedVerifyGraphCapability(CustomTestCase):
         ):
             with self.subTest(backend=backend.__name__):
                 self.assertTrue(backend.supports_ragged_verify_graph)
+
+
+class TestRaggedVerifyCaptureGeometry(CustomTestCase):
+    def test_capture_iterates_token_keys_without_width_multiplication(self):
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.ragged_verify_mode = True
+        runner.capture_num_tokens = [8, 16, 40, 224]
+        runner.capture_bs = [8, 16, 24, 32]
+        runner.max_bs = 32
+        runner.captured_req_width = 7
+
+        self.assertEqual(runner._capture_shape_keys(), [8, 16, 40, 224])
+        self.assertEqual(runner._capture_shape_geometry(8), (8, 8))
+        self.assertEqual(runner._capture_shape_geometry(40), (32, 40))
+        self.assertEqual(runner._capture_shape_geometry(224), (32, 224))
+
+    def test_static_capture_keeps_request_key_semantics(self):
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.ragged_verify_mode = False
+        runner.capture_num_tokens = None
+        runner.capture_bs = [8, 16, 24, 32]
+        runner.max_bs = 32
+        runner.captured_req_width = 7
+
+        self.assertEqual(runner._capture_shape_keys(), [8, 16, 24, 32])
+        self.assertEqual(runner._capture_shape_geometry(8), (8, 56))
+
+    def test_admission_requires_an_exact_captured_backend_key(self):
+        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+
+        class _Backend:
+            def __init__(self, keys):
+                self.keys = keys
+
+            def can_run(self, _forward_batch, shape_key):
+                return shape_key.size in self.keys
+
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.attn_backend = SimpleNamespace(supports_ragged_verify_graph=True)
+        runner.capture_num_tokens = [8, 16]
+        runner.max_bs = 8
+        runner.enable_pdmux = False
+        runner.record_nolora_graph = False
+        runner.attention_graph_variants = None
+        runner.require_mlp_sync = False
+        runner.is_encoder_decoder = False
+        runner.capture_hidden_mode = CaptureHiddenMode.FULL
+        runner.backend = _Backend({8})
+        forward_batch = SimpleNamespace(
+            batch_size=1,
+            can_run_decode_cuda_graph=True,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+        )
+
+        self.assertTrue(
+            runner._can_run_ragged_verify_graph(
+                forward_batch, SimpleNamespace(graph_num_tokens=8)
+            )
+        )
+        self.assertFalse(
+            runner._can_run_ragged_verify_graph(
+                forward_batch, SimpleNamespace(graph_num_tokens=12)
+            )
+        )
+        runner.backend = _Backend(set())
+        self.assertFalse(
+            runner._can_run_ragged_verify_graph(
+                forward_batch, SimpleNamespace(graph_num_tokens=8)
+            )
+        )
+
+    def test_staging_rejects_an_uncaptured_layout_key(self):
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner._captured_ragged_layouts = {}
+
+        with self.assertRaisesRegex(RuntimeError, "uncaptured token key 8"):
+            runner._stage_ragged_verify_layout(SimpleNamespace(), graph_size_key=8)
 
 
 if __name__ == "__main__":
