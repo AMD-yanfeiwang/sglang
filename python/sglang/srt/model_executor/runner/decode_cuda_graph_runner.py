@@ -642,7 +642,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # verify_lens / qo_indptr and mis-slices the packed q rows.
         cap_layout = self._captured_ragged_layouts.get(graph_size_key)
         if cap_layout is None:
-            return
+            raise RuntimeError(
+                f"ragged verify selected uncaptured token key {graph_size_key}; "
+                f"captured keys are {sorted(self._captured_ragged_layouts)}"
+            )
         live = ragged_layout
         if live.bs != cap_layout.bs or live.cap is None:
             live = live.padded_to_bucket(
@@ -747,9 +750,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return False
 
         admission_tokens = ragged_layout.graph_num_tokens
-        is_tokens_supported = admission_tokens <= self.capture_num_tokens[
-            -1
-        ] and forward_batch.batch_size <= self._ragged_capture_slots(admission_tokens)
+        graph_key = self._make_graph_key(
+            admission_tokens,
+            stream_idx=get_current_stream_idx() if self.enable_pdmux else None,
+            variant_label=self._resolve_lora_variant(forward_batch),
+            attention_variant=self._resolve_attention_variant(forward_batch),
+        )
+        is_tokens_supported = (
+            admission_tokens in self.capture_num_tokens
+            and forward_batch.batch_size <= self._ragged_capture_slots(admission_tokens)
+            and self.backend.can_run(forward_batch, graph_key)
+        )
 
         is_dp_supported = (
             forward_batch.can_run_decode_cuda_graph if self.require_mlp_sync else True
