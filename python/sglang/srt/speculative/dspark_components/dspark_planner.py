@@ -210,6 +210,15 @@ class DSparkVerifyPlanner:
         return self._confidence_head is not None
 
     @property
+    def needs_confidence(self) -> bool:
+        """Whether this schedule consumes confidence at runtime.
+
+        Compact mode with an uninitialized SPS table is verify-all: its layout
+        is uniform and returned before the confidence scheduler runs.
+        """
+        return self.carries_confidence and not self._is_verify_all
+
+    @property
     def last_confidence_raw(self) -> Optional[torch.Tensor]:
         if self._confidence_head is None:
             return None

@@ -58,6 +58,30 @@ class TestRaggedVerifyCaptureGeometry(CustomTestCase):
         self.assertEqual(runner._capture_shape_geometry(40), (32, 40))
         self.assertEqual(runner._capture_shape_geometry(224), (32, 224))
 
+    def test_verify_all_uses_minimal_request_slots(self):
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.ragged_verify_mode = True
+        runner.capture_num_tokens = [8, 16, 24, 32, 40, 224]
+        runner.capture_bs = [8, 16, 24, 32]
+        runner.max_bs = 32
+        runner.captured_req_width = 7
+        runner.model_runner = SimpleNamespace(ragged_verify_capture_tokens_per_slot=7)
+
+        self.assertEqual(runner._capture_shape_geometry(8), (2, 8))
+        self.assertEqual(runner._capture_shape_geometry(40), (6, 40))
+        self.assertEqual(runner._capture_shape_geometry(224), (32, 224))
+
+        for live_bs in range(1, 33):
+            full_tokens = live_bs * 7
+            graph_tokens = ((full_tokens + 7) // 8) * 8
+            capture_slots = runner._ragged_capture_slots(graph_tokens)
+            self.assertGreaterEqual(capture_slots, live_bs)
+            self.assertLessEqual(graph_tokens, capture_slots * 7)
+
     def test_static_capture_keeps_request_key_semantics(self):
         from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
             DecodeCudaGraphRunner,
@@ -90,6 +114,7 @@ class TestRaggedVerifyCaptureGeometry(CustomTestCase):
         runner.attn_backend = SimpleNamespace(supports_ragged_verify_graph=True)
         runner.capture_num_tokens = [8, 16]
         runner.max_bs = 8
+        runner.captured_req_width = 7
         runner.enable_pdmux = False
         runner.record_nolora_graph = False
         runner.attention_graph_variants = None

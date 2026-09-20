@@ -274,6 +274,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             tp_sync=self._tp_sync,
         )
+        # Verify-all layouts keep the full per-request width, so a token tier
+        # needs only ceil(tokens / width) request slots. Dynamic compact
+        # schedules retain the conservative one-token-per-slot geometry.
+        self.model_runner.ragged_verify_capture_tokens_per_slot = (
+            self.verify_num_draft_tokens if self._verify_planner.is_verify_all else 1
+        )
         if (
             get_parallel().enable_dp_attention
             and not self._draft_is_moe
@@ -496,7 +502,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             available_memory_gb=available_memory_gb,
             confidence_fn=(
                 self._verify_planner.compute_confidence_tensor
-                if self._verify_planner.carries_confidence
+                if self._verify_planner.needs_confidence
                 else None
             ),
             out=(
@@ -742,7 +748,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         draft_tokens = draft_block.draft_tokens
 
         confidence = proposal.confidence
-        if confidence is None:
+        if confidence is None and self._verify_planner.needs_confidence:
             confidence = self._verify_planner.compute_confidence_tensor(
                 draft_hidden=proposal.draft_hidden,
                 anchor_tokens=draft_block_ids[:, 0],

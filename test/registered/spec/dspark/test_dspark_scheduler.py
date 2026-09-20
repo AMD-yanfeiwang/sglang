@@ -9,6 +9,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
 )
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
+    DSparkVerifyPlanner,
     HostConfidenceBudgetPlanner,
     VerifyBudgetDecision,
     compute_verify_token_budget,
@@ -551,6 +552,21 @@ class TestBudgetTierSelection(CustomTestCase):
                 model_runner=model_runner,
             )
         )
+
+
+class TestVerifyAllConfidence(CustomTestCase):
+    def test_verify_all_does_not_compute_confidence(self):
+        planner = DSparkVerifyPlanner.__new__(DSparkVerifyPlanner)
+        planner._confidence_head = object()
+        planner._is_verify_all = True
+        self.assertTrue(planner.carries_confidence)
+        self.assertFalse(planner.needs_confidence)
+
+    def test_dynamic_schedule_keeps_confidence(self):
+        planner = DSparkVerifyPlanner.__new__(DSparkVerifyPlanner)
+        planner._confidence_head = object()
+        planner._is_verify_all = False
+        self.assertTrue(planner.needs_confidence)
 
 
 if __name__ == "__main__":
