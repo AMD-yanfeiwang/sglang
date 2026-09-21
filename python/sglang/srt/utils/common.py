@@ -3962,8 +3962,6 @@ def get_cuda_graph_batch_size_alignment() -> int:
         alignment *= 2
     if require_gathered_buffer():
         alignment *= get_parallel().attn_tp_size
-    if alignment % get_parallel().attn_cp_size != 0:
-        alignment *= get_parallel().attn_cp_size
     return alignment
 
 
@@ -3979,6 +3977,18 @@ def get_eager_max_batch_size(max_batch_size: int) -> int:
 
     max_batch_size = ceil_align(max_batch_size, get_parallel().attn_tp_size)
     return ceil_align(max_batch_size, get_cp_padding_align_size())
+
+
+def get_max_dummy_batch_size(max_batch_size: int) -> int:
+    """Largest batch a warmup or graph-capture forward can present.
+
+    The eager warmup pads by a CP-aware rule that the cuda-graph capture grid
+    does not share, so batch-indexed buffers must cover both ceilings.
+    """
+    return max(
+        get_cuda_graph_max_batch_size(max_batch_size),
+        get_eager_max_batch_size(max_batch_size),
+    )
 
 
 def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optional[str]:
