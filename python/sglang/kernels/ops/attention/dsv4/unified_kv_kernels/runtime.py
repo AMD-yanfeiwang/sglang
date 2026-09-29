@@ -46,6 +46,7 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode_indices i
     write_v4_paged_decode_indices,
 )
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_prefill import (
+    _opus_epilogue_kwargs,
     sparse_attn_v4_paged_prefill,
 )
 
@@ -682,6 +683,9 @@ def prefill_fp8_2buff(
     attn_sink: torch.Tensor,  # [H] fp32
     softmax_scale: float,
     v_head_dim: int,
+    inv_rope_positions: torch.Tensor | None = None,  # [>=T] int
+    inv_rope_freqs: torch.Tensor | None = None,  # [max_pos, rope_dim] fp32
+    out_scale: torch.Tensor | None = None,  # [T, G, H*D/G/128] uint8 -> fp8 o
 ) -> torch.Tensor:
     """Prefill over the two-pool fp8 unified_kv, through aiter's opus kernel.
 
@@ -702,6 +706,8 @@ def prefill_fp8_2buff(
     ``decode_fp8_2buff`` there is nothing to mask off the result afterwards. An
     empty prefix is the live case here, not a guard: chunk 0 has nothing
     committed yet and every token's prefix segment is empty.
+
+    ``inv_rope_*`` / ``out_scale``: output epilogue, as in ``prefill``.
     """
     from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_fp8_opus
 
@@ -758,7 +764,12 @@ def prefill_fp8_2buff(
             f"{name} indptr holds {indptr.shape[0]} entries, kernel reads {T + 1}"
         )
 
-    out = q_rope.new_empty((T, H, v_head_dim))
+    if inv_rope_positions is not None:
+        inv_rope_positions = inv_rope_positions.to(torch.int64)
+    out = q_rope.new_empty(
+        (T, H, v_head_dim),
+        dtype=q_rope.dtype if out_scale is None else torch.float8_e4m3fn,
+    )
     return pa_sparse_prefill_fp8_opus(
         q,
         q_rope,
@@ -773,6 +784,7 @@ def prefill_fp8_2buff(
         attn_sink,
         softmax_scale,
         out=out,
+        **_opus_epilogue_kwargs(inv_rope_positions, inv_rope_freqs, out_scale),
     )
 
 
@@ -787,6 +799,9 @@ def prefill(
     kv_indptr_extend: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
+    inv_rope_positions: torch.Tensor | None = None,  # [>=T] int
+    inv_rope_freqs: torch.Tensor | None = None,  # [max_pos, rope_dim] fp32
+    out_scale: torch.Tensor | None = None,  # [T, G, H*D/G/128] uint8 -> fp8 o
 ) -> torch.Tensor:
     return sparse_attn_v4_paged_prefill(
         q,
@@ -798,4 +813,7 @@ def prefill(
         kv_indptr_extend,
         attn_sink,
         softmax_scale,
+        inv_rope_positions=inv_rope_positions,
+        inv_rope_freqs=inv_rope_freqs,
+        out_scale=out_scale,
     )

@@ -54,12 +54,27 @@ from sglang.srt.utils.common import is_gfx95_supported, is_gfx1250_supported
 # OPUS gfx950 paged-prefill kernel is preferred when importable; otherwise fall
 # back to the Triton implementation below.
 try:
+    import aiter.ops.pa_sparse_prefill_opus as _opus_mod
     from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_opus
 
     _HAS_OPUS = is_gfx95_supported() and not is_gfx1250_supported()
+    # ...and it can inverse-RoPE / mxfp8-quantize its output in the epilogue.
+    OPUS_HAS_EPILOGUE = _HAS_OPUS and "gfx950" in getattr(
+        _opus_mod, "OUTPUT_EPILOGUE_ARCHS", ()
+    )
 except ImportError:
     pa_sparse_prefill_opus = None
-    _HAS_OPUS = False
+    _HAS_OPUS = OPUS_HAS_EPILOGUE = False
+
+
+def _opus_epilogue_kwargs(inv_rope_positions, inv_rope_freqs, out_scale) -> dict:
+    # Only set ones are passed, so an aiter without the epilogue still takes the call.
+    kw = dict(
+        inv_rope_positions=inv_rope_positions,
+        inv_rope_freqs=inv_rope_freqs,
+        out_scale=out_scale,
+    )
+    return {k: v for k, v in kw.items() if v is not None}
 
 
 @triton.jit
@@ -295,6 +310,9 @@ def sparse_attn_v4_paged_prefill(
     kv_indptr_extend: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
+    inv_rope_positions: torch.Tensor | None = None,
+    inv_rope_freqs: torch.Tensor | None = None,
+    out_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """V4 prefill sparse attention over two KV sources (paged unified_kv +
     flat per-fwd kv).
@@ -312,10 +330,16 @@ def sparse_attn_v4_paged_prefill(
       kv_indptr_extend:  [T+1] int32 — true prefix sum.
       attn_sink:         [H] — per-head softmax-denom bias.
       softmax_scale:     float.
+      inv_rope_* / out_scale: output epilogue, same contract as
+        `sparse_attn_v4_paged_decode` (OPUS_HAS_EPILOGUE only).
 
     Returns:
-      out: [T, H, D] same dtype as q.
+      out: [T, H, D] same dtype as q (fp8 e4m3fn with out_scale).
     """
+    if inv_rope_positions is not None or out_scale is not None:
+        assert OPUS_HAS_EPILOGUE, "only aiter's OPUS kernel has the output epilogue"
+        if inv_rope_positions is not None:
+            inv_rope_positions = inv_rope_positions.to(torch.int64)
     if _HAS_OPUS:
         # OPUS contract differs from the Triton kernel in two ways the Triton
         # path tolerates implicitly:
@@ -345,6 +369,7 @@ def sparse_attn_v4_paged_prefill(
             kv_indptr_extend,
             attn_sink,
             softmax_scale,
+            **_opus_epilogue_kwargs(inv_rope_positions, inv_rope_freqs, out_scale),
         )
     return _sparse_attn_v4_paged_prefill_triton(
         q,

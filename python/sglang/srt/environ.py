@@ -1571,11 +1571,12 @@ class Envs:
     # inverse_rope_group_quant) instead of a separate fused_rope_inplace + Triton
     # quant. Off by default; requires SGLANG_OPT_FP8_WO_A_GEMM and the aiter op.
     SGLANG_OPT_FP8_WO_A_FUSED_INVROPE = EnvBool(False)
-    # ROCm unified_kv_triton bf16 pool: fold the attention-output inverse RoPE
-    # into the paged-decode epilogue (decode/verify). No-op when
+    # ROCm unified_kv_triton: fold the attention-output inverse RoPE into the
+    # bf16 paged-decode epilogue (decode/verify) and, with a recent aiter, the
+    # OPUS paged-prefill epilogue (extend modes, either pool). No-op when
     # SGLANG_OPT_FP8_WO_A_FUSED_INVROPE is in effect (its quant already rotates).
     SGLANG_OPT_DSV4_DECODE_FUSED_INVROPE = EnvBool(False)
-    # With the fold above and the ROCm fp8 wo_a GEMM: the same epilogue also emits
+    # With the fold above and the ROCm fp8 wo_a GEMM: the same epilogues also emit
     # the wo_a mxfp8 activation (fp8 o + e8m0 scales), dropping the quant kernel.
     SGLANG_OPT_DSV4_DECODE_FUSED_WO_A_QUANT = EnvBool(False)
     # SM100/SM103: collapse the bf16 wo_a verify chain (fused_rope_inplace,

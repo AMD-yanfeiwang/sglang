@@ -2149,7 +2149,7 @@ class MQALayer(MqaAttentionBase):
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_fp8,
             is_unified_kv_triton,
-            unified_decode_fuses_inv_rope,
+            unified_attn_fuses_inv_rope,
         )
 
         unified = is_unified_kv_triton()
@@ -2330,7 +2330,7 @@ class MQALayer(MqaAttentionBase):
         attn_rotated = (
             unified
             and not wo_a_rotates
-            and unified_decode_fuses_inv_rope(forward_batch.forward_mode)
+            and unified_attn_fuses_inv_rope(forward_batch.forward_mode)
         )
         # ...and also already mxfp8-quantized for the aiter wo_a GEMM below.
         attn_quantized = (

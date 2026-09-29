@@ -1648,7 +1648,7 @@ class DeepseekV4HipRadixBackend(
     ) -> torch.Tensor:
         """q_rope present: packed fp8 q over the two-pool fp8 layout (asm decode;
         prefill also needs k_rope). Absent: plain bf16 q and pool (Triton).
-        inv_rope_*: return o inverse-RoPE'd (env_gate.unified_decode_fuses_inv_rope).
+        inv_rope_*: return o inverse-RoPE'd (env_gate.unified_attn_fuses_inv_rope).
         out_scale: return fp8 o and fill its wo_a e8m0 scales (see paged_decode)."""
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
 
@@ -1673,10 +1673,10 @@ class DeepseekV4HipRadixBackend(
         # decode; its per-token decode streams were built in metadata.
         verify_as_decode = forward_batch.forward_mode.is_target_verify()
         is_decode = forward_batch.forward_mode.is_decode_or_idle() or verify_as_decode
-        # The model skips its own inverse RoPE when passing these; only the bf16
-        # Triton decode below applies them.
-        assert (inv_rope_positions is None and out_scale is None) or (
-            is_decode and q_rope is None
+        # The model skips its own inverse RoPE when passing these; the bf16 Triton
+        # decode and both (OPUS) prefills below apply them, the fp8 asm decode not.
+        assert (inv_rope_positions is None and out_scale is None) or not (
+            is_decode and q_rope is not None
         )
         if is_decode:
             if verify_as_decode:
@@ -1852,6 +1852,9 @@ class DeepseekV4HipRadixBackend(
                 attn_sink=attn_sink,
                 softmax_scale=self.softmax_scale,
                 v_head_dim=layer.v_head_dim,
+                inv_rope_positions=inv_rope_positions,
+                inv_rope_freqs=inv_rope_freqs,
+                out_scale=out_scale,
             )
         else:
             o = runtime.prefill(
@@ -1864,6 +1867,9 @@ class DeepseekV4HipRadixBackend(
                 kv_indptr_extend=kext_p,
                 attn_sink=attn_sink,
                 softmax_scale=self.softmax_scale,
+                inv_rope_positions=inv_rope_positions,
+                inv_rope_freqs=inv_rope_freqs,
+                out_scale=out_scale,
             )
 
         # write this chunk's SWA K into the ring for future chunks / decode

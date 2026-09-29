@@ -37,20 +37,28 @@ def is_unified_kv_fp8() -> bool:
 
 
 @functools.lru_cache(maxsize=1)
-def _decode_inv_rope_fusion_enabled() -> bool:
-    # bf16 Triton paged decode only: the fp8 asm reader and gfx1250's aiter
-    # pa_decode_sparse have no epilogue hook.
+def _inv_rope_fusion_enabled() -> bool:
+    # gfx1250's aiter pa_decode_sparse has no epilogue hook.
     return (
         envs.SGLANG_OPT_DSV4_DECODE_FUSED_INVROPE.get()
         and is_unified_kv_triton()
-        and not is_unified_kv_fp8()
         and not is_gfx1250_supported()
     )
 
 
-def unified_decode_fuses_inv_rope(forward_mode) -> bool:
-    """Whether the attention output comes back inverse-RoPE'd. Static config +
-    forward_mode only, so the decision is fixed per captured graph."""
-    return _decode_inv_rope_fusion_enabled() and (
-        forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()
+def unified_attn_fuses_inv_rope(forward_mode) -> bool:
+    """Whether the attention output comes back inverse-RoPE'd (and can come back
+    mxfp8-quantized). Static config + forward_mode only, so the decision is
+    fixed per captured graph."""
+    if not _inv_rope_fusion_enabled():
+        return False
+    # decode/verify run the Triton paged decode (bf16 pool; the fp8 asm reader
+    # has no epilogue hook), the other modes aiter's OPUS prefill (either pool),
+    # whose epilogue needs a recent enough aiter.
+    if forward_mode.is_decode_or_idle() or forward_mode.is_target_verify():
+        return not is_unified_kv_fp8()
+    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_prefill import (
+        OPUS_HAS_EPILOGUE,
     )
+
+    return OPUS_HAS_EPILOGUE
