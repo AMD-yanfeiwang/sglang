@@ -185,6 +185,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
                 extend_seq_lens=torch.tensor([1, 2], dtype=torch.int32),
                 num_tokens=3,
                 exact_num_tokens=True,
+                retain_global_positions=True,
             )
 
         repeat_interleave.assert_called_once()
@@ -193,6 +194,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         self.assertEqual(core.unified.pf_chunk_start.tolist(), [0, 1, 1, 0])
         self.assertEqual(core.unified.pf_cu_q.tolist(), [0, 1, 1, 0])
         self.assertEqual(core.unified.pf_final_pos.tolist(), [0, 2, 2, 128])
+        self.assertEqual(core.unified.pf_positions.tolist(), [0, 1, 2, 0])
 
     def test_eager_prefill_marks_host_proven_token_count_exact(self):
         backend = object.__new__(DeepseekV4HipRadixBackend)
@@ -243,6 +245,11 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         )
         self.assertTrue(
             backend._attach_unified_kv_prefill_meta.call_args.kwargs["exact_num_tokens"]
+        )
+        self.assertFalse(
+            backend._attach_unified_kv_prefill_meta.call_args.kwargs[
+                "retain_global_positions"
+            ]
         )
 
     def test_cp_prefill_attaches_before_reindex(self):
@@ -302,6 +309,11 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         self.assertEqual(
             backend.make_core_attn_metadata.call_args.kwargs["num_tokens"], 3
         )
+        self.assertTrue(
+            backend._attach_unified_kv_prefill_meta.call_args.kwargs[
+                "retain_global_positions"
+            ]
+        )
         core.apply_cp_reindex.assert_called_once_with(num_tokens=3)
         # Target prefill rebuilds FlashMLA on the local rows; the draft skips it.
         self.assertEqual(
@@ -339,7 +351,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         self.assertEqual(core.raw_out_loc.tolist(), [0, 1, 2])
         self.assertEqual(core.swa_out_cache_loc.tolist(), [0, 1, 2])
 
-    def test_cp_unified_uses_inert_query_padding_and_logical_ring_rows(self):
+    def test_cp_unified_fp8_uses_inert_padding_and_logical_ring_pair(self):
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
 
         backend = object.__new__(DeepseekV4HipRadixBackend)
@@ -347,7 +359,12 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
             unified_swa_window=128,
             unified_swa_ring_size=128,
             unified_swa_pages=8,
-            get_unified_kv=lambda _layer_id: torch.zeros(32, 4),
+            get_unified_kv=lambda _layer_id: torch.zeros(32, 4, dtype=torch.uint8).view(
+                torch.float8_e4m3fn
+            ),
+            get_unified_kv_rope=lambda _layer_id: torch.zeros(
+                32, 2, dtype=torch.bfloat16
+            ),
         )
         backend.softmax_scale = 0.5
         core = SimpleNamespace(
@@ -356,6 +373,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
                 pf_chunk_start=torch.tensor([5, 5, 5, 0], dtype=torch.int64),
                 pf_cu_q=torch.tensor([0, 0, 0, 0], dtype=torch.int64),
                 pf_final_pos=torch.tensor([7, 7, 7, 128], dtype=torch.int64),
+                pf_positions=torch.tensor([5, 6, 7, 0], dtype=torch.int64),
             ),
             c128_page_indices=None,
             c4_sparse_page_indices=None,
@@ -367,10 +385,12 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
                 is_target_verify=lambda: False,
                 is_decode_or_idle=lambda: False,
             ),
-            positions=torch.tensor([5, 6, 7], dtype=torch.int64),
+            # CP BCG replaces the batch field with rank-local static positions.
+            positions=torch.tensor([6, 0], dtype=torch.int64),
         )
-        kv = torch.arange(12, dtype=torch.float32).view(3, 4)
-        output = torch.zeros(2, 1, 4)
+        kv = torch.arange(12, dtype=torch.uint8).view(3, 4).view(torch.float8_e4m3fn)
+        kv_rope = torch.arange(6, dtype=torch.bfloat16).view(3, 2)
+        output = torch.zeros(2, 1, 4, dtype=torch.bfloat16)
 
         with (
             mock.patch(f"{_HIP_RADIX}.is_cp_active", return_value=True),
@@ -388,11 +408,13 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
                     torch.tensor([0, 0, 0], dtype=torch.int32),
                 ),
             ) as build_indices,
-            mock.patch.object(runtime, "prefill", return_value=output),
+            mock.patch.object(
+                runtime, "prefill_fp8_2buff", return_value=output
+            ) as prefill,
             mock.patch.object(runtime, "store_swa_into_unified") as store,
         ):
             result = backend._forward_unified_kv(
-                q=torch.zeros(2, 1, 4),
+                q=torch.zeros(2, 1, 4, dtype=torch.uint8).view(torch.float8_e4m3fn),
                 kv=kv,
                 layer=SimpleNamespace(layer_id=0, v_head_dim=4),
                 forward_batch=forward_batch,
@@ -400,13 +422,18 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
                 attn_sink=torch.zeros(1),
                 core_attn_metadata=core,
                 save_kv_cache=True,
+                q_rope=torch.zeros(2, 1, 2, dtype=torch.bfloat16),
+                k_rope=kv_rope,
             )
 
         self.assertIs(result, output)
         self.assertEqual(build_indices.call_args.kwargs["positions"].tolist(), [6, 0])
         self.assertEqual(build_indices.call_args.kwargs["chunk_start"].tolist(), [5, 0])
         self.assertEqual(build_indices.call_args.kwargs["cu_q"].tolist(), [0, 0])
+        self.assertIs(prefill.call_args.kwargs["kv_extend"], kv)
+        self.assertIs(prefill.call_args.kwargs["kv_extend_rope"], kv_rope)
         self.assertEqual(store.call_args.kwargs["kv"].shape[0], 3)
+        self.assertTrue(torch.equal(store.call_args.kwargs["kv_rope"], kv_rope))
         self.assertEqual(store.call_args.kwargs["state_slot"].tolist(), [7, 7, 7])
         self.assertEqual(store.call_args.kwargs["positions"].tolist(), [5, 6, 7])
         self.assertEqual(store.call_args.kwargs["final_pos"].tolist(), [7, 7, 7])
