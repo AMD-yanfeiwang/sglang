@@ -174,6 +174,48 @@ def draft_layer_cases(cfg):
     return fails
 
 
+def k2_switch_cases():
+    """SGLANG_ROCM_MONO_K2 needs SGLANG_ROCM_MONO_K1; with every switch on, draft layers still get no launches."""
+    from sglang.srt.models.deepseek_common.amd import dsv41_mono_decode as m
+
+    names = (
+        "SGLANG_ROCM_MONO_DECODE",
+        "SGLANG_ROCM_MONO_K1",
+        "SGLANG_ROCM_MONO_K2",
+    )
+    old = {k: os.environ.get(k) for k in names}
+    fails = []
+    try:
+        for k in names:
+            os.environ.pop(k, None)
+        os.environ["SGLANG_ROCM_MONO_DECODE"] = os.environ["SGLANG_ROCM_MONO_K2"] = "1"
+        try:
+            m.init_layer(types.SimpleNamespace())
+            why = None
+        except ValueError as e:
+            why = str(e)
+        ok = why == "SGLANG_ROCM_MONO_K2 needs SGLANG_ROCM_MONO_K1=1."
+        print(f"  {'PASS' if ok else 'FAIL'} K2 without K1 refused: {why}")
+        if not ok:
+            fails.append("K2 without K1")
+        os.environ["SGLANG_ROCM_MONO_K1"] = "1"
+        draft = types.SimpleNamespace(
+            mlp=types.SimpleNamespace(is_nextn=True), config=None
+        )
+        m.init_layer(draft)
+        ok = draft.mono_ffn is None and draft.mono_k1 is None and draft.mono_k2 is None
+        print(f"  {'PASS' if ok else 'FAIL'} draft layer with K2 on: no launches")
+        if not ok:
+            fails.append("draft layer with K2")
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return fails
+
+
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else "deepseek-ai/DeepSeek-V4.1-Flash"
     cfg = load_config(path)
@@ -205,8 +247,9 @@ def main():
     f, nm = step_cases()
     fails += f
     fails += draft_layer_cases(cfg)
+    fails += k2_switch_cases()
     print(
-        f"{len(cases)} negative cases + warmup + {ns} speculative + {nm} step + 2 layer cases; "
+        f"{len(cases)} negative cases + warmup + {ns} speculative + {nm} step + 2 layer + 2 K2 switch cases; "
         + ("ALL PASS" if not fails else f"FAILED: {fails}")
     )
     sys.exit(1 if fails else 0)
