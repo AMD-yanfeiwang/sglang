@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""K1 geometry and scratch layout."""
+"""K1 and K2 attention geometry and scratch layouts."""
 
 from dataclasses import dataclass
 
@@ -13,9 +13,15 @@ NOPE = 448
 ROPE = 64
 HALF = ROPE // 2
 N_HEADS = 64
+O_GROUPS = 8
+O_RANK = 1024
+WINDOW = 128
+TOPK = 512
 EPS = 1e-20
 
 ROWS = 16  # GEMV rows a task
+HEAD_TILE = 16  # heads an attention MFMA takes
+WOA_ROWS = 32  # a wo_a task's rows: one MX group of its output
 
 # KV record (V4 fp8_ds_mla): 576 B rows (448 e4m3, 64 bf16), then 8 B of scales a token
 DATA = 576
@@ -50,9 +56,35 @@ class Dims:
     def wqb_tasks(self) -> int:
         return self.q_rows // ROWS
 
+    @property
+    def head_tiles(self) -> int:
+        return self.heads // HEAD_TILE
+
+    @property
+    def groups(self) -> int:
+        return O_GROUPS // self.tp
+
+    @property
+    def group_k(self) -> int:
+        """wo_a's K a group: its eight heads' outputs."""
+        return self.heads // self.groups * HEAD_DIM  # 4096
+
+    @property
+    def o_rows(self) -> int:
+        return self.groups * O_RANK
+
+    @property
+    def woa_tasks(self) -> int:
+        return self.o_rows // WOA_ROWS
+
+    @property
+    def wob_tasks(self) -> int:
+        return HIDDEN // ROWS  # 320
+
 
 WQKV_TASKS = QKV_ROWS // ROWS  # 112
 WQKV_KPARTS = 2  # X8's K halves (a flag each); an LDS window of the wqkv GEMV
+KEYS = TOPK + WINDOW  # a token's attention keys at most
 
 
 def wqkv_order(s):
@@ -85,4 +117,26 @@ def front_scratch(s: int, d: Dims) -> dict:
             ("qx8s", s * Q_RANK // 32 * 4),  # an i32 code a group
             ("qrdy", s * PAIR),
         ]
+    )
+
+
+def back_scratch(s: int, d: Dims, start: int = 0) -> dict:
+    """Return K2's attention-back scratch regions -> (byte offset, bytes), laid out past ``start``."""
+    ck = (
+        64 if d.head_tiles == 2 and s * cdiv(KEYS, 64) <= 256 else 128
+    )  # back.chunk_keys
+    nchunk = cdiv(KEYS, ck)
+    return byte_layout(
+        [
+            ("part", s * nchunk * d.heads * HEAD_DIM * 2),  # bf16 partials
+            ("pstat", s * nchunk * d.heads * 8),  # (max, sum) f32
+            ("srdy", s * nchunk * PAIR),
+            ("xo", s * d.q_rows),  # e4m3 words
+            ("xos", s * d.q_rows // 32 * 4),  # an i32 code a group
+            ("crdy", s * d.heads // 8 * PAIR),
+            ("x8b", s * d.o_rows),
+            ("x8bs", s * d.o_rows // 32 * 4),
+            ("ardy", d.woa_tasks * PAIR),
+        ],
+        start=start,
     )

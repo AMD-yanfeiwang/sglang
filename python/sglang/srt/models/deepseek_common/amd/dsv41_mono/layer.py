@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Build K1 (attention seam and front) and the FFN launch (seam, MoE and TP all-reduce)."""
+"""Build K1 (attention seam and front), K2 (attention back, then the FFN launch's stages) and the FFN launch
+(seam, MoE and TP all-reduce).
+
+Tags: K1's hand-offs carry 2 e + 1, K2's and the FFN launch's 2 e + 2 (e: the epoch, which K2's or the FFN
+launch's CTA 0 moves on at its end), so K2's FFN seam may reuse K1's seam regions.
+"""
 
 from dataclasses import dataclass
 
@@ -10,13 +15,14 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
+from .attention import back as mb_back
 from .attention import front as mb_front
-from .attention.plan import Dims, front_scratch
+from .attention.plan import Dims, back_scratch, front_scratch
 from .common.epoch import EPOCH_MARKS, epoch_begin, epoch_end, gstore, kernel_symbol
 from .common.mx import clamp_fp8
 from .common.ops import CM_DEV, butterfly, fp8_pack4, peer_bases, rsrc, traced
 from .common.plan import BLOCKS, THREADS, WAVES, first_task, key_tuple
-from .common.sync import Mailbox, publish, sreg
+from .common.sync import Mailbox, preg, publish, sreg
 from .sources import SOURCES
 from .stages import moe, seam
 from .stages.dims import Dims as StageDims
@@ -51,6 +57,10 @@ def _front_key(key: MonoBuild):
     return mb_front.FrontBuild(key.tokens, key.tp)
 
 
+def _back_key(key: MonoBuild):
+    return mb_back.BackBuild(key.tokens, key.tp)
+
+
 def scratch_layout(s: int, tp: int) -> dict:
     """Return each scratch region of width s -> (byte offset, bytes), without overlap."""
     d = Dims(tp)
@@ -73,6 +83,8 @@ def scratch_layout(s: int, tp: int) -> dict:
     lo = min(o for o, _ in mr.values())
     place({n: (o - lo, n_) for n, (o, n_) in mr.items()})
     place({"normed": (0, s * HIDDEN * 2), "xrdy_moe": (s * HIDDEN * 2 + 256, s * 8)})
+    # K2's own regions past the FFN launch's, whose offsets stay as they were
+    place(back_scratch(s, d))
     return out
 
 
@@ -571,6 +583,277 @@ def build_mono_ffn(key: MonoBuild):
         _ = keyed
         kffn(
             part,
+            res_in,
+            post_in,
+            comb_in,
+            pre_in,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            ffn_w,
+            res_out,
+            post_out,
+            comb_out,
+            pre_out,
+            gate_w,
+            bias,
+            w13,
+            w13_s,
+            w2,
+            w2_s,
+            sgu,
+            sgu_s,
+            sw2,
+            sw2_s,
+            out,
+            scratch,
+            sym,
+            peers,
+            rank,
+            epoch,
+        ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
+
+    return launch
+
+
+# ---------------------------------------------------------------- K2
+
+
+def build_mono_k2(key: MonoBuild):
+    """Build K2: the attention back (its wo_b partial pushed to every rank), then ``run_ffn``."""
+    s, tp = key.tokens, key.tp
+    assert 1 <= s <= MAX_TOKENS
+    layout = scratch_layout(s, tp)
+    bkey = _back_key(key)
+    rs = route_shape(_moe_key(key))
+    assert rs.experts // 64 in SORT_NETS
+    BackM = mb_back.back_lds_members(s, Dims(tp))
+    SplitLds, GemvLds = BackM["split"], BackM["gemv"]
+    MoeLds = moe.moe_smem(s, rs)
+    half = peer_half_bytes(tp)
+    assert SLICES + 2 * s <= BLOCKS
+    SeamLds = _seam_lds(s)
+
+    @fx.union
+    class K2Lds:
+        split: SplitLds  # type: ignore[valid-type]
+        gemv: GemvLds  # type: ignore[valid-type]
+        seam: SeamLds  # type: ignore[valid-type]
+        moe: MoeLds  # type: ignore[valid-type]
+
+    name = kernel_symbol("dsv41_mono_k2", s=s, tp=tp)
+    keyed = key_tuple(key, SOURCES)
+
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    def k2(
+        q: Int64,
+        swa: Int64,
+        swa_stride: Int64,
+        swa_block: Int32,
+        comp: Int64,
+        comp_stride: Int64,
+        comp_block: Int32,
+        sidx: Int64,
+        slen: Int64,
+        cidx: Int64,
+        comp_len: Int64,
+        kt: Int64,
+        klen: Int64,
+        pos: Int64,
+        sink: Int64,
+        qk_scale: Int32,
+        cos_sin: Int64,
+        woa: Int64,
+        woa_s: Int64,
+        wob: Int64,
+        wob_s: Int64,
+        zrec: Int64,
+        res_in: Int64,
+        post_in: Int64,
+        comb_in: Int64,
+        pre_in: Int64,
+        hc_fn: Int64,
+        hc_scale: Int64,
+        hc_base: Int64,
+        ffn_w: Int64,
+        res_out: Int64,
+        post_out: Int64,
+        comb_out: Int64,
+        pre_out: Int64,
+        gate_w: Int64,
+        bias: Int64,
+        w13: Int64,
+        w13_s: Int64,
+        w2: Int64,
+        w2_s: Int64,
+        sgu: Int64,
+        sgu_s: Int64,
+        sw2: Int64,
+        sw2_s: Int64,
+        out: Int64,
+        scratch: Int64,
+        sym: Int64,
+        peers: Int64,
+        rank: Int32,
+        epoch: Int64,
+    ):
+        _ = keyed
+        bid = fx.block_idx.x
+        lds = fx.SharedAllocator().allocate(K2Lds)
+        ep = _epoch(epoch)
+        tag = (ep << 1) + 2
+        par = fx.Int64(ep & 1) * fx.Int64(half)
+        bases = [b + par for b in peer_bases(peers, tp)]
+        own = sym + par
+        bargs = {
+            "q": q,
+            "swa": swa,
+            "swa_stride": swa_stride,
+            "swa_block": swa_block,
+            "comp": comp,
+            "comp_stride": comp_stride,
+            "comp_block": comp_block,
+            "sidx": sidx,
+            "slen": slen,
+            "cidx": cidx,
+            "comp_len": comp_len,
+            "kt": kt,
+            "klen": klen,
+            "pos": pos,
+            "sink": sink,
+            "qk_scale": qk_scale,
+            "cos_sin": cos_sin,
+            "woa": woa,
+            "woa_s": woa_s,
+            "wob": wob,
+            "wob_s": wob_s,
+            "out": 0,
+            "out_stride": 0,
+            "zrec": zrec,
+        }
+        blayout = {n: layout[n] for n in back_scratch(s, Dims(tp))}
+        views = {"split": lds.split.peek(), "gemv": lds.gemv.peek()}
+        c = mb_back.back_context(bkey, views, bargs, scratch, tag, blayout)
+        amb = Mailbox(tag)
+
+        def push(t, col, v0, v1):
+            # this rank's bf16 partial pair to every rank's ATTN region
+            for p in range_constexpr(tp):
+                dst = preg(bases[p], 0, "attn")
+                amb.put_bf(dst, 2 * seam.attn_region_pair(rank, t, s, col), [v0, v1])
+
+        c["wob_out"] = push
+        epoch_begin(c, epoch, ep)
+        mb_back.run_back(c, bkey, bid)
+        gpu.barrier()
+
+        ffn = dict(
+            res_in=res_in,
+            post_in=post_in,
+            comb_in=comb_in,
+            pre_in=pre_in,
+            hc_fn=hc_fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
+            ffn_w=ffn_w,
+            res_out=res_out,
+            post_out=post_out,
+            comb_out=comb_out,
+            pre_out=pre_out,
+            gate_w=gate_w,
+            bias=bias,
+            w13=w13,
+            w13_s=w13_s,
+            w2=w2,
+            w2_s=w2_s,
+            sgu=sgu,
+            sgu_s=sgu_s,
+            sw2=sw2,
+            sw2_s=sw2_s,
+            out=out,
+            scratch=scratch,
+            epoch=epoch,
+        )
+        run_ffn(key, lds, ffn, amb, bases, own, rank, ep)
+
+    @flyc.jit
+    def launch(
+        q: Int64,
+        swa: Int64,
+        swa_stride: Int64,
+        swa_block: Int32,
+        comp: Int64,
+        comp_stride: Int64,
+        comp_block: Int32,
+        sidx: Int64,
+        slen: Int64,
+        cidx: Int64,
+        comp_len: Int64,
+        kt: Int64,
+        klen: Int64,
+        pos: Int64,
+        sink: Int64,
+        qk_scale: Int32,
+        cos_sin: Int64,
+        woa: Int64,
+        woa_s: Int64,
+        wob: Int64,
+        wob_s: Int64,
+        zrec: Int64,
+        res_in: Int64,
+        post_in: Int64,
+        comb_in: Int64,
+        pre_in: Int64,
+        hc_fn: Int64,
+        hc_scale: Int64,
+        hc_base: Int64,
+        ffn_w: Int64,
+        res_out: Int64,
+        post_out: Int64,
+        comb_out: Int64,
+        pre_out: Int64,
+        gate_w: Int64,
+        bias: Int64,
+        w13: Int64,
+        w13_s: Int64,
+        w2: Int64,
+        w2_s: Int64,
+        sgu: Int64,
+        sgu_s: Int64,
+        sw2: Int64,
+        sw2_s: Int64,
+        out: Int64,
+        scratch: Int64,
+        sym: Int64,
+        peers: Int64,
+        rank: Int32,
+        epoch: Int64,
+        stream: fx.Stream = _STREAM,
+    ):
+        _ = keyed
+        k2(
+            q,
+            swa,
+            swa_stride,
+            swa_block,
+            comp,
+            comp_stride,
+            comp_block,
+            sidx,
+            slen,
+            cidx,
+            comp_len,
+            kt,
+            klen,
+            pos,
+            sink,
+            qk_scale,
+            cos_sin,
+            woa,
+            woa_s,
+            wob,
+            wob_s,
+            zrec,
             res_in,
             post_in,
             comb_in,

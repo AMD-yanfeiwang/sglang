@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Device primitives of K1's attention front, adapted from ATOM's mono decode framework."""
+"""Device primitives of the attention launches (K1's front, K2's back), adapted from ATOM's mono decode framework."""
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr
 from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
-from flydsl.expr.typing import T
+from flydsl.expr.typing import T, as_ir_value
 
+from sglang.srt.models.deepseek_common.amd.dsv41_mono.common.epoch import _gptr
 from sglang.srt.models.deepseek_common.amd.dsv41_mono.common.ops import bf16_pair, rsrc
 from sglang.srt.models.deepseek_common.amd.dsv41_mono.common.sync import _spin
 
@@ -34,6 +37,14 @@ def ld_i32(ptr, i, cm=0):
     return fx.Int32(
         bo.buffer_load(rsrc(ptr), i, vec_width=1, dtype=T.i32, cache_modifier=cm)
     )
+
+
+def gload(addr, words=4, nt=False):
+    """Load ``words`` i32 (1, 2 or 4) at a 64-bit global address (a cache past 4 GiB: buffer offsets are 32 bits)."""
+    i32 = ir.IntegerType.get_signless(32)
+    ty = i32 if words == 1 else ir.VectorType.get([words], i32)
+    v = llvm.LoadOp(ty, _gptr(addr), alignment=4 * words, nontemporal=nt or None).result
+    return fx.Int32(v) if words == 1 else fx.Vector(v)
 
 
 # ----------------------------------------------------------------------------- math
@@ -81,6 +92,23 @@ def mx_code(amax):
 def mx_mul(code):
     """2^(127 - code) as fp32, for code in [0, 254] (the quant multiplier)."""
     return ((254 - code) << 23).bitcast(fx.Float32)
+
+
+def pow2(code):
+    """The fp32 power of two a biased exponent (1..254) stands for."""
+    return (code << 23).bitcast(fx.Float32)
+
+
+def fp8x8_bf16(w0, w1, scale):
+    """Eight E4M3 of two dwords times an f32 power-of-two ``scale`` -> eight bf16 as a 4-dword Vector (exact)."""
+    out = []
+    for w in (w0, w1):
+        for hi in (False, True):
+            p = rocdl.cvt_scalef32_pk_bf16_fp8(
+                T.bf16x2, as_ir_value(fx.Int32(w)), as_ir_value(fx.Float32(scale)), hi
+            )
+            out.append(fx.Vector(p).bitcast(fx.Int32)[0])
+    return fx.Vector.from_elements(out, fx.Int32)
 
 
 # ----------------------------------------------------------------------------- MFMA
