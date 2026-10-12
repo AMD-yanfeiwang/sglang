@@ -1642,6 +1642,8 @@ class Envs:
     # gfx950 DeepSeek-V4.1 decode (<= 48 rows): FFN in one launch; MONO_K1 adds the attention front
     SGLANG_ROCM_MONO_DECODE = EnvBool(False)
     SGLANG_ROCM_MONO_K1 = EnvBool(False)
+    # with MONO_K1: K2 runs the attention back (split attention, wo_a, wo_b) with the FFN launch's stages
+    SGLANG_ROCM_MONO_K2 = EnvBool(False)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)

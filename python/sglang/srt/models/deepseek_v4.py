@@ -5551,6 +5551,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         if not is_nextn:
             if _is_hip:
                 _hip.stash_k1_weights(self.model.layers)
+                _hip.stash_k2_weights(self.model.layers)
             for i, layer in enumerate(self.model.layers):
                 if getattr(layer, "engram", None) is not None:
                     layer.engram.embed.finish_load(label=f"layer {i}")

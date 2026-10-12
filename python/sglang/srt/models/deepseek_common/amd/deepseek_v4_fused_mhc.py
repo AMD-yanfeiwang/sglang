@@ -593,18 +593,23 @@ def forward_hc_pre_from_prev_fused_boundary(
         q, residual, post, comb, pre = k1(
             positions, forward_batch, *pending_post, prev_pre
         )
-        mono = dsv41_mono_decode.ffn_launch(layer, forward_batch, residual.shape[0])
-        with layer.self_attn.maybe_use_decode_attn_tp(forward_batch):
-            x = layer.self_attn(
-                x=residual[:, 0],
-                positions=positions,
-                forward_batch=forward_batch,
-                defer_all_reduce=True,
-                mono_q=q,
-            )
-        if not isinstance(x, AttnOutput):
-            raise RuntimeError("mono K1: the attention reduced wo_b itself")
-        x, residual, post, comb, pre = mono(x.partial, residual, post, comb, pre)
+        k2 = getattr(layer, "mono_k2", None)
+        if k2 is not None:
+            # K2 runs the attention back and the FFN launch's stages from K1's outputs
+            x, residual, post, comb, pre = k2(forward_batch, residual.shape[0])
+        else:
+            mono = dsv41_mono_decode.ffn_launch(layer, forward_batch, residual.shape[0])
+            with layer.self_attn.maybe_use_decode_attn_tp(forward_batch):
+                x = layer.self_attn(
+                    x=residual[:, 0],
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    defer_all_reduce=True,
+                    mono_q=q,
+                )
+            if not isinstance(x, AttnOutput):
+                raise RuntimeError("mono K1: the attention reduced wo_b itself")
+            x, residual, post, comb, pre = mono(x.partial, residual, post, comb, pre)
         if defer_post:
             return None, pre, (x, residual, post, comb)
         return layer.hc_post(x, residual, post, comb), pre, None

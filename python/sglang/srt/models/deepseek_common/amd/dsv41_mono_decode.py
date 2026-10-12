@@ -152,8 +152,10 @@ def _unsupported_k1(attn) -> Optional[str]:
 
 
 def init_layer(layer) -> None:
-    """Attach the layer's FFN launch and K1 launch (or None); an opt-in the deployment cannot serve raises."""
-    layer.mono_ffn = layer.mono_k1 = None
+    """Attach the layer's FFN launch, K1 and K2 launches (or None); an opt-in the deployment cannot serve raises."""
+    layer.mono_ffn = layer.mono_k1 = layer.mono_k2 = None
+    if envs.SGLANG_ROCM_MONO_K2.get() and not envs.SGLANG_ROCM_MONO_K1.get():
+        raise ValueError("SGLANG_ROCM_MONO_K2 needs SGLANG_ROCM_MONO_K1=1.")
     if not envs.SGLANG_ROCM_MONO_DECODE.get():
         if envs.SGLANG_ROCM_MONO_K1.get():
             raise ValueError("SGLANG_ROCM_MONO_K1 needs SGLANG_ROCM_MONO_DECODE=1.")
@@ -176,6 +178,8 @@ def init_layer(layer) -> None:
             and a.indexer is None
         ):
             layer.mono_k1 = MonoK1(layer)
+            if envs.SGLANG_ROCM_MONO_K2.get():
+                layer.mono_k2 = MonoK2(layer)
 
 
 def stash_shared_expert(layers, name: str, loaded_weight: torch.Tensor) -> None:
@@ -493,6 +497,145 @@ def stash_k1_weights(layers) -> None:
                 a.wqkv_a.weight.detach().clone(),
                 a.wq_b.weight.detach().clone(),
             )
+
+
+def _wo_a_fp8(w: torch.Tensor):
+    """Return SGLang's bf16 wo_a (V4.1's 32 x 32 fp8 blocks, dequantized at load) as e4m3 with an E8M0 code a block.
+    The smallest power of two >= amax / 448 a block keeps every value on the e4m3 grid, so the copy is exact."""
+    n, k = w.shape
+    blocks = w.float().view(n // 32, 32, k // 32, 32)
+    amax = blocks.abs().amax(dim=(1, 3)).clamp_min(torch.finfo(torch.float32).tiny)
+    bits = (amax / 448.0).view(torch.int32)
+    code = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).int()
+    scale = (code << 23).view(torch.float32)[:, None, :, None]
+    w8 = (blocks / scale).view(n, k).to(torch.float8_e4m3fn)
+    back = (w8.float().view(n // 32, 32, k // 32, 32) * scale).view(n, k).to(w.dtype)
+    if not torch.equal(back, w):
+        raise RuntimeError("K2: wo_a is not on an fp8 32 x 32 block grid")
+    return w8.contiguous(), code.to(torch.uint8).contiguous()
+
+
+def _records(buf: torch.Tensor, rows: int) -> torch.Tensor:
+    """Return a pool layer's [pages, page bytes] buffer (uint8, or the c{r} pools' e4m3) as [pages, rows, 584]
+    V4 records."""
+    buf = buf if buf.dtype == torch.uint8 else buf.view(torch.uint8)
+    return torch.as_strided(buf, (buf.shape[0], rows, 584), (buf.stride(0), 584, 1))
+
+
+class MonoK2:
+    """One standard layer's K2 launch, after its K1: the attention over SGLang's window and compressed key
+    lists, wo_a, wo_b and their TP reduce, then the FFN launch's stages."""
+
+    def __init__(self, layer):
+        self.layer = layer
+        # (e4m3 wo_a, its E8M0 codes), from stash_k2_weights
+        self.wo_a = None
+        self._weights = None
+        self._caches = None
+
+    def weights(self):
+        if self._weights is not None:
+            return self._weights
+        from sglang.srt.models.deepseek_common.amd.dsv41_mono.attention.plan import (
+            Dims,
+        )
+        from sglang.srt.models.deepseek_common.amd.dsv41_mono.runner import (
+            AttnWeights,
+        )
+
+        layer, a = self.layer, self.layer.self_attn
+        if self.wo_a is None:
+            raise RuntimeError("stash_k2_weights did not run after loading")
+        p, wob = get_parallel(), a.wo_b
+        # K2 reduces wo_b's output over the TP group itself, where SGLang's attention defers its reduce
+        if not (
+            a.attn_tp_size == p.tp_size
+            and wob.reduce_results
+            and not wob.use_decode_attn_tp
+        ):
+            raise RuntimeError("K2 needs wo_b reduced over the whole TP group")
+        if getattr(wob, "aiter_bpreshuffled", False) or getattr(
+            wob, "mxfp8_native_ready", False
+        ):
+            raise RuntimeError("K2 needs the row-major wo_b (--fp8-gemm-backend aiter)")
+        wob_s = getattr(wob, "weight_scale_mx_e8m0", None)
+        k1, h = layer.mono_k1.weights(), a.n_local_heads
+        self._weights = AttnWeights(
+            layer_id=a.layer_id,
+            wqkv=k1["wqkv"],
+            wqkv_scale=k1["wqkv_s"],
+            q_norm=k1["q_norm"],
+            kv_norm=k1["kv_norm"],
+            wq_b=k1["wqb"],
+            wq_b_scale=k1["wqb_s"],
+            wo_a=self.wo_a[0],
+            wo_a_scale=self.wo_a[1],
+            wo_b=wob.weight,
+            wo_b_scale=(
+                _e8m0(wob.weight_scale_inv)
+                if wob_s is None
+                else wob_s.view(torch.uint8)
+            ),
+            # every rank holds all heads' sinks
+            attn_sink=a.attn_sink.data[a.attn_tp_rank * h : (a.attn_tp_rank + 1) * h],
+            cos_sin=k1["cos_sin"],
+            ratio=a.compress_ratio,
+        )
+        self.wo_a = None
+        self._weights.check(Dims(p.tp_size))
+        return self._weights
+
+    def __call__(self, forward_batch, rows: int):
+        """Run K2 on the ``rows`` rows K1 left in the runner; return (MoE output, residual, post, comb, pre)."""
+        from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
+        from sglang.srt.model_executor.forward_context import (
+            get_attn_backend,
+            get_token_to_kv_pool,
+        )
+
+        a = self.layer.self_attn
+        if should_skip_mlp_all_reduce():
+            raise RuntimeError("K2 reduces wo_b itself, the step reduce-scatters it")
+        pool = get_token_to_kv_pool()
+        # the caches are read without the hierarchical cache's per-layer waits
+        if pool.layer_transfer_counter is not None:
+            raise RuntimeError("K2 needs the KV cache resident, no layer transfers")
+        if self._caches is None:
+            lid = a.layer_id
+            self._caches = (
+                _records(pool.get_swa_raw_buffer(lid), pool.get_swa_key_page_size()),
+                _records(
+                    pool.get_extra_key_buffer(lid), pool.get_extra_key_page_size(lid)
+                ),
+            )
+        swa, comp = self._caches
+        core = get_attn_backend().forward_metadata.core_attn_metadata
+        r = a.compress_ratio
+        # K1's int64 positions of this step
+        _, pos, _ = forward_batch._mono_k1_meta
+        out, residual, post, comb, pre = _get_runner(pos.device).k2(
+            self.layer.mono_ffn.weights(),
+            self.weights(),
+            rows,
+            pos,
+            swa,
+            core.swa_page_indices,
+            core.swa_topk_lengths,
+            comp,
+            core.sparse_page_indices(r),
+            core.sparse_topk_lengths(r),
+        )
+        return out, residual, post.view(post.shape[0], -1), comb, pre
+
+
+def stash_k2_weights(layers) -> None:
+    """Make the K2 layers' e4m3 wo_a copies (SGLang keeps wo_a bf16) at the end of loading, before the KV cache
+    is sized."""
+    for layer in layers:
+        k2 = getattr(layer, "mono_k2", None)
+        if k2 is not None:
+            w = layer.self_attn.wo_a.weight.data
+            k2.wo_a = _wo_a_fp8(w.reshape(-1, w.shape[-1]))
 
 
 def k1_launch(layer, forward_batch, pending_post, prev_pre) -> Optional[MonoK1]:
