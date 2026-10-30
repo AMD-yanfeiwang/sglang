@@ -160,6 +160,8 @@ class UnifiedCacheLinker(ABC):
     Store ``forward_stream`` and use ``record_transfer_ready()`` to gate loads
     and offloads. ``layer_done_counter`` provides ``set_consumer(index)`` and
     ``wait_until(layer)``. Report completion only after device copies finish.
+    A store whose eviction should hear about device hits sets
+    ``touch_interval_s`` and implements ``touch()``.
     """
 
     layer_done_counter: object
@@ -168,6 +170,9 @@ class UnifiedCacheLinker(ABC):
     prefetch_policy = "timeout"
     # None when the current stream is the only one using the pages.
     forward_stream: Optional[torch.cuda.Stream] = None
+    # Seconds between touches of one device node, set in __init__ and read once
+    # when the cache attaches the linker; None never calls touch().
+    touch_interval_s: Optional[float] = None
 
     def record_transfer_ready(self) -> TransferReady:
         """Record what a transfer waits on before it touches device pages.
@@ -187,6 +192,17 @@ class UnifiedCacheLinker(ABC):
     def prefetch(self, transfers: list[PoolTransfer]) -> Future[bool] | None:
         """Read all layers; the future completes after all device writes stop."""
         return None
+
+    def touch(self, transfers: list[PoolTransfer]) -> None:
+        """Best-effort hint that these pages were just served from the device
+        cache, for a store whose eviction cannot see device hits.
+
+        LOOKUP-phase transfers, one per linked component, whose keys run from
+        the sequence head to the device boundary; each transfer's own keys
+        name the pages it holds (TRAILING_PAGES: the window ending at the
+        boundary). Called inside the rank-lockstep match, so it must not
+        block, raise, or communicate across ranks.
+        """
 
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
@@ -330,6 +346,15 @@ class UnifiedCacheLinkerWrapper:
         self.pending_offloads: list[_PendingOffload] = []
         # Page-aligned radix-key prefix excluded from offload during an insert.
         self.offload_skip_prefix_len = 0
+        self._touch_interval_s = cache_linker.touch_interval_s
+        if self._touch_interval_s is not None and not self._touch_interval_s > 0:
+            raise ValueError(
+                f"touch_interval_s must be None or > 0, got {self._touch_interval_s}."
+            )
+        # Device nodes touched in the current interval bucket; NodeIds are
+        # never reused.
+        self._touch_bucket = -1
+        self._touched: set[NodeId] = set()
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -348,6 +373,8 @@ class UnifiedCacheLinkerWrapper:
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
         device_hit_len = result.device_prefix_len
+        if device_hit_len >= page and self._touch_interval_s is not None:
+            self._touch(result.last_device_node, device_hit_len // page)
         if self.load_mode == "prefetch":
             # Prefetch is issued on enqueue; only completed GPU KV is matchable.
             return result
@@ -399,6 +426,41 @@ class UnifiedCacheLinkerWrapper:
                 result.mamba_host_hit_length, mamba_host_hit_length
             ),
         )
+
+    def _touch(self, node_id: NodeId, pages: int) -> None:
+        """Touch the pages up to ``node_id``, once per node and interval.
+
+        Decided from the node and the wall-clock interval, so the ranks of a
+        group touch the same pages; a match that straddles an interval edge
+        can move one rank's touch to its next match.
+        """
+        try:
+            bucket = int(time.time() // self._touch_interval_s)
+            if bucket != self._touch_bucket:
+                self._touch_bucket = bucket
+                self._touched.clear()
+            elif node_id in self._touched:
+                return
+            self._touched.add(node_id)
+            tree_core = self.cache.tree_core
+            hashes = tree_core.get_prefix_hash_values(
+                node_id
+            ) + tree_core.get_hash_values(node_id)
+            if len(hashes) != pages:
+                return
+            transfers = []
+            for component in self._components:
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOOKUP, None, hashes
+                )
+                if transfer is None:
+                    return
+                transfers.append(transfer)
+            self.cache_linker.touch(transfers)
+        except Exception:
+            # A hint must never break the rank-lockstep match it runs in.
+            logger.exception("External cache touch failed; touches stop on this rank.")
+            self._touch_interval_s = None
 
     def prefetch(self, req: Req) -> None:
         """Stage a queued request; publish only after all ranks succeed."""
@@ -891,6 +953,7 @@ class UnifiedCacheLinkerWrapper:
     def _clear_state(self) -> None:
         for request in list(self.prefetches):
             self._finish_prefetch(request, publish=False)
+        self._touched.clear()
         self.hit_markers.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
