@@ -634,7 +634,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     ) -> int:
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
         indexer_size_per_token = ceil_div(
-            index_head_dim + index_head_dim // DSATokenToKVPool.quant_block_size * 4,
+            # FP4: e2m1 keys and a ue8m0 exponent per 32 dims
+            index_head_dim // 2 + index_head_dim // 32
+            if get_exec().kernel.enable_dsa_fp4_indexer
+            else index_head_dim
+            + index_head_dim // DSATokenToKVPool.quant_block_size * 4,
             get_dsa_index_kpool(kvc.model_config.hf_config),
         )
         element_size = torch._utils._element_size(
