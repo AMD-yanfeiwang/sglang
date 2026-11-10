@@ -794,6 +794,10 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
         self.started_loads = []
         self.load_landed = True
         self.completed_offloads = []
+        self.touch_calls = []
+
+    def touch(self, transfers):
+        self.touch_calls.append(self._clone_transfers(transfers))
 
     @staticmethod
     def _clone_transfer(transfer):
@@ -1546,6 +1550,31 @@ class TestUnifiedCacheLinkerPythonBackend(
             linker.complete_next_offload(True)
         cache.check_hicache_events()
         cache.sanity_check()
+
+    def test_running_requests_touch_their_cached_prefix_once_per_interval(self):
+        self.cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.MAMBA),
+            kv_size=64,
+            max_context_len=64,
+        )
+        cache, allocator, req_pool = build_fixture(self.cfg)
+        linker = _InMemoryUnifiedCacheLinker(defaultdict(set))
+        linker.touch_interval_s = 30.0
+        cache.init_cache_linker(linker)
+        node = self._insert(cache, allocator, req_pool, list(range(1, 7)))
+        running = self._make_req(req_pool)
+        running.last_node, running.extra_key = node.last_device_node, None
+        idle = self._make_req(req_pool)
+        idle.last_node, idle.extra_key = cache.root_node_handle(), None
+
+        for _ in range(2):
+            self.assertEqual(cache.finish_external_linker_loads([running, idle]), [])
+        (touch,) = linker.touch_calls
+        kv = next(transfer for transfer in touch if transfer.name == PoolName.KV)
+        self.assertEqual(
+            kv.keys, cache.tree_core.get_hash_values(node.last_device_node)
+        )
 
     def test_mamba_state_round_trips_only_at_its_checkpoint(self):
         tokens = list(range(1, 7))

@@ -465,8 +465,9 @@ class UnifiedCacheLinkerWrapper:
             ),
         )
 
-    def _touch(self, node_id: NodeId, pages: int) -> None:
-        """Touch the pages up to ``node_id``, once per node and interval.
+    def _touch(self, node_id: NodeId, pages: Optional[int]) -> None:
+        """Touch the pages up to ``node_id``, once per node and interval;
+        ``pages``, when given, is the path length the node must have.
 
         Decided from the node and the wall-clock interval, so the ranks of a
         group touch the same pages; a match that straddles an interval edge
@@ -484,7 +485,7 @@ class UnifiedCacheLinkerWrapper:
             hashes = tree_core.get_prefix_hash_values(
                 node_id
             ) + tree_core.get_hash_values(node_id)
-            if len(hashes) != pages:
+            if not hashes or (pages is not None and len(hashes) != pages):
                 return
             transfers = []
             for component in self._components:
@@ -499,6 +500,24 @@ class UnifiedCacheLinkerWrapper:
             # A hint must never break the rank-lockstep match it runs in.
             logger.exception("External cache touch failed; touches stop on this rank.")
             self._touch_interval_s = None
+
+    def touch_running(self, reqs: Sequence[Req]) -> None:
+        """Touch the cached prefix of each request in a batch. A decoding
+        request's prompt-end state may leave the device long before its next
+        turn, and the store's copy ages from when it was written."""
+        if self._touch_interval_s is None:
+            return
+        for req in reqs:
+            node = req.last_node
+            if (
+                node is None
+                or is_virtual_node(node)
+                or node == self.cache.root_node_handle(req.extra_key)
+            ):
+                continue
+            self._touch(node, None)
+            if self._touch_interval_s is None:
+                return
 
     def prefetch(self, req: Req) -> None:
         """Stage a queued request; publish only after all ranks succeed."""
