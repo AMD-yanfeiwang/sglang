@@ -817,7 +817,9 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
     def _clone_transfers(cls, transfers):
         return [cls._clone_transfer(transfer) for transfer in transfers]
 
-    def lookup(self, rid, transfers):
+    resident_lookup = True
+
+    def lookup(self, rid, transfers, resident_pages=0):
         transfers = self._clone_transfers(transfers)
         self.lookup_calls.append((rid, transfers))
         by_pool = {transfer.name: transfer for transfer in transfers}
@@ -827,7 +829,8 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
 
         restorable = []
         for prefix_pages in range(1, len(kv.keys) + 1):
-            if not set(kv.keys[:prefix_pages]) <= self.stored_keys[PoolName.KV]:
+            stored = kv.keys[resident_pages:prefix_pages]
+            if not set(stored) <= self.stored_keys[PoolName.KV]:
                 continue
             for transfer in transfers:
                 if transfer.name == PoolName.KV:
@@ -838,7 +841,7 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
                         max(0, prefix_pages - window_pages) : prefix_pages
                     ]
                 else:
-                    required = kv.keys[:prefix_pages]
+                    required = stored
                 if not set(required) <= self.stored_keys[transfer.name]:
                     break
             else:
@@ -1472,6 +1475,76 @@ class TestUnifiedCacheLinkerPythonBackend(
         linker.complete_next_offload(True)
         cache.check_hicache_events()
         self.assertEqual(cache.linker.pending_offloads, [])
+        cache.sanity_check()
+
+    def test_state_only_load_reuses_resident_kv_the_store_dropped(self):
+        self.cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.MAMBA),
+            kv_size=64,
+            max_context_len=64,
+        )
+        cache, allocator, req_pool = build_fixture(self.cfg)
+        linker = _InMemoryUnifiedCacheLinker(defaultdict(set))
+        cache.init_cache_linker(linker)
+        tokens = list(range(1, 7))
+        node = self._insert(cache, allocator, req_pool, tokens).last_device_node
+        for _ in linker.offload_calls:
+            linker.complete_next_offload(True)
+        cache.check_hicache_events()
+        resident_kv = cache.path_device_indices(node).clone()
+        # The device drops the state but keeps the KV, and the store drops the
+        # KV it is never asked to read.
+        self._evict_device_component(cache, node, ComponentType.MAMBA)
+        linker.stored_keys[PoolName.KV].clear()
+
+        req = self._make_req(req_pool)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
+        )
+        self.assertEqual(match.device_prefix_len, 0)
+        self.assertEqual(match.host_hit_length, len(tokens))
+        self._apply_match_to_req(req, match)
+        loaded, last_node = cache.init_load_back(
+            InitLoadBackParams(
+                best_match_node=match.best_match_node,
+                host_hit_length=match.host_hit_length,
+                req=req,
+            )
+        )
+        self.assertEqual((loaded, last_node), (len(tokens), node))
+        (state_load,) = linker.queued_loads[req.rid]
+        self.assertEqual(state_load.name, PoolName.MAMBA)
+        self.assertEqual(req.kv.cache_protected_len, len(tokens))
+
+        # Admission as the scheduler does it for a linker load.
+        req.last_node = last_node
+        req.prefix_len += loaded
+        prefix = cache.prefix_device_indices(req)
+        self.assertTrue(torch.equal(prefix, resident_kv))
+        req_pool.write((req.kv.req_pool_idx, slice(0, len(prefix))), prefix)
+        req.origin_input_ids, req.output_ids = array("q", tokens), array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.extend_end = len(tokens)
+        req.kv.kv_committed_len = len(prefix)
+        req.kv.kv_allocated_len = len(prefix)
+        req.extra_key = None
+        req.lock = cache.lock(req.last_node)
+        free_before = allocator.available_size()
+
+        self.assertGreaterEqual(cache.ready_to_load_host_cache(), 0)
+        self.assertEqual(cache.finish_external_linker_loads([req]), [])
+        cache.checkpoint(req, up_to=req.extend_end)
+        cache.unlock(req.lock)
+        req.lock = None
+
+        # The tree kept its KV pages and holds the loaded state again.
+        self.assertEqual(allocator.available_size(), free_before)
+        final = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        self.assertEqual(final.device_prefix_len, len(tokens))
+        while linker.pending_offloads:
+            linker.complete_next_offload(True)
+        cache.check_hicache_events()
         cache.sanity_check()
 
     def test_mamba_state_round_trips_only_at_its_checkpoint(self):

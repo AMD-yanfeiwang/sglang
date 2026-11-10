@@ -495,7 +495,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             ]
         raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
 
-    def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+    resident_lookup = True
+
+    def lookup(
+        self, rid: str, transfers: list[PoolTransfer], resident_pages: int = 0
+    ) -> list[int]:
         expanded = self.pool_group.resolve_transfers(transfers)
         if not expanded:
             return []
@@ -511,7 +515,13 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             # cannot change the answer. This runs synchronously inside the
             # scheduler's prefill batch build, and DP-attention ranks are
             # lockstep, so every extra key is stall charged to all of them.
-            page_exists = self._page_exists(page_keys[: valid_pages[-1]], transfer)
+            end = valid_pages[-1]
+            resident = 0
+            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+                resident = min(resident_pages, end)
+            page_exists = [True] * resident + self._page_exists(
+                page_keys[resident:end], transfer
+            )
             valid_pages = self._apply_hit_policy(valid_pages, page_exists, transfer)
             if not valid_pages:
                 break
