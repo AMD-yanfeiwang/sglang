@@ -1576,6 +1576,37 @@ class TestUnifiedCacheLinkerPythonBackend(
             kv.keys, cache.tree_core.get_hash_values(node.last_device_node)
         )
 
+    def test_finished_output_stays_out_of_the_store(self):
+        self.cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.MAMBA),
+            kv_size=64,
+            max_context_len=64,
+        )
+        cache, allocator, req_pool = build_fixture(self.cfg)
+        linker = _InMemoryUnifiedCacheLinker(defaultdict(set))
+        cache.init_cache_linker(linker)
+        tokens = list(range(1, 9))
+
+        # A node across the prompt end offloads its prompt pages, not its state.
+        with cache.linker.offload_window(0, 6):
+            node = self._insert(cache, allocator, req_pool, tokens).last_device_node
+            cache.linker.offload_new_state(node)
+        (kv,) = linker.offload_calls[-1]
+        self.assertEqual(kv.name, PoolName.KV)
+        self.assertEqual(kv.keys, cache.tree_core.get_hash_values(node)[:6])
+
+        # A node wholly past it offloads nothing.
+        offloads = len(linker.offload_calls)
+        with cache.linker.offload_window(0, len(tokens)):
+            tail = self._insert(cache, allocator, req_pool, tokens + [9, 10])
+            cache.linker.offload_new_state(tail.last_device_node)
+        self.assertEqual(len(linker.offload_calls), offloads)
+        while linker.pending_offloads:
+            linker.complete_next_offload(True)
+        cache.check_hicache_events()
+        cache.sanity_check()
+
     def test_mamba_state_round_trips_only_at_its_checkpoint(self):
         tokens = list(range(1, 7))
         consumer, consumer_req_pool, consumer_linker = self._mamba_linker_consumer(

@@ -721,7 +721,17 @@ class UnifiedRadixCache(BasePrefixCache):
             is_bigram=self.tree_core.is_eagle,
             cache_salt=req.cache_salt,
         ).page_aligned(self.page_size)
-        return self.linker.skip_offload_prefix(len(skip_key))
+        end_limit = 0
+        if envs.SGLANG_OPT_LINKER_SKIP_OUTPUT_OFFLOAD.get() and req.finished():
+            end_limit = len(
+                RadixKey(
+                    req.origin_input_ids,
+                    req.extra_key,
+                    is_bigram=self.tree_core.is_eagle,
+                    cache_salt=req.cache_salt,
+                ).page_aligned(self.page_size)
+            )
+        return self.linker.offload_window(len(skip_key), end_limit)
 
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
