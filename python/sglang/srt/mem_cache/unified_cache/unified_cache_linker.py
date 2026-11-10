@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
@@ -293,6 +294,13 @@ class _PendingOffload(NamedTuple):
     lock_node_id: NodeId
     lock_params: DecLockRefParams
     publish_node_ids: list[NodeId]
+    # A Mamba state added to a node already stored or pending: the tree tracks
+    # no external state for it, so its ack only releases the lock.
+    state_only: bool = False
+
+
+def _slot_of(indices: torch.Tensor) -> int:
+    return int(indices.reshape(-1)[0].item())
 
 
 class UnifiedCacheLinkerWrapper:
@@ -355,6 +363,11 @@ class UnifiedCacheLinkerWrapper:
         # never reused.
         self._touch_bucket = -1
         self._touched: set[NodeId] = set()
+        # Node -> the device Mamba slot whose state went to the store. The
+        # write-through chain offloads new leaves only, so a state attached to
+        # a node already stored would never get there.
+        self._offload_states = ComponentType.MAMBA in cache.components
+        self._state_offloaded: dict[NodeId, int] = {}
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -819,7 +832,50 @@ class UnifiedCacheLinkerWrapper:
                 transfers = self._drop_offload_skip_prefix(node_id, transfers)
                 if transfers is None:
                     continue
-            self._offload_node(node_id, transfers)
+            if self._offload_node(node_id, transfers):
+                state = next((t for t in transfers if t.name == PoolName.MAMBA), None)
+                if state is not None:
+                    self._state_offloaded[node_id] = _slot_of(state.device_indices)
+
+    def offload_new_state(self, node_id: NodeId) -> None:
+        """Offload the Mamba state an insert left on ``node_id`` when the
+        write-through chain did not: the node was already stored or pending,
+        or its walk-time offload ran before the state was attached."""
+        if not self._offload_states:
+            return
+        tree_core = self.cache.tree_core
+        value = tree_core.get_component_device_value(node_id, ComponentType.MAMBA)
+        if value is None:
+            return
+        slot = _slot_of(value)
+        if self._state_offloaded.get(node_id) == slot:
+            return
+        hashes = tree_core.get_hash_values(node_id)
+        if not hashes:
+            return
+        # The component's own OFFLOAD transfer: one state, keyed by the node end.
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            device_indices=value,
+            keys=[hashes[-1]],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        cache = self.cache
+        lock_params = cache.inc_lock_ref(node_id).to_dec_params()
+        try:
+            queued = self.cache_linker.offload(
+                [transfer], session_id=getattr(cache, "insert_session_id", None)
+            )
+        except BaseException:
+            cache.dec_lock_ref(node_id, lock_params)
+            raise
+        if not queued:
+            cache.dec_lock_ref(node_id, lock_params)
+            return
+        self._state_offloaded[node_id] = slot
+        self.pending_offloads.append(
+            _PendingOffload(node_id, lock_params, [], state_only=True)
+        )
 
     @contextmanager
     def skip_offload_prefix(self, length: int):
@@ -860,7 +916,7 @@ class UnifiedCacheLinkerWrapper:
             kept.append(transfer)
         return kept
 
-    def _offload_node(self, node_id: NodeId, transfers: list[PoolTransfer]) -> None:
+    def _offload_node(self, node_id: NodeId, transfers: list[PoolTransfer]) -> bool:
         cache = self.cache
         lock_params = cache.inc_lock_ref(node_id).to_dec_params()
         try:
@@ -872,16 +928,17 @@ class UnifiedCacheLinkerWrapper:
             raise
         if not queued:
             cache.dec_lock_ref(node_id, lock_params)
-            return
+            return False
 
         cache.tree_core.mark_external_linker_offload_pending(node_id)
         self.pending_offloads.append(_PendingOffload(node_id, lock_params, [node_id]))
+        return True
 
     def replace_pending_offload_node(
         self, ack_id: NodeId, old_node_id: NodeId, new_node_ids: list[NodeId]
     ) -> None:
         for index, pending in enumerate(self.pending_offloads):
-            if pending.lock_node_id != ack_id:
+            if pending.lock_node_id != ack_id or pending.state_only:
                 continue
             publish_node_ids = []
             for node_id in pending.publish_node_ids:
@@ -907,9 +964,13 @@ class UnifiedCacheLinkerWrapper:
         assert len(successes) <= len(self.pending_offloads)
         for success in successes:
             pending = self.pending_offloads.pop(0)
-            self.cache.tree_core.finish_external_linker_offload(
-                pending.publish_node_ids, pending.lock_node_id, success
-            )
+            if not pending.state_only:
+                self.cache.tree_core.finish_external_linker_offload(
+                    pending.publish_node_ids, pending.lock_node_id, success
+                )
+            if not success:
+                # The state never landed; a later insert of the node retries it.
+                self._state_offloaded.pop(pending.lock_node_id, None)
             self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
 
     def start_layer_wise_loading(self) -> int:
@@ -954,14 +1015,16 @@ class UnifiedCacheLinkerWrapper:
         for request in list(self.prefetches):
             self._finish_prefetch(request, publish=False)
         self._touched.clear()
+        self._state_offloaded.clear()
         self.hit_markers.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
         self.inflight_load_index = -1
         for pending in self.pending_offloads:
-            self.cache.tree_core.finish_external_linker_offload(
-                pending.publish_node_ids, pending.lock_node_id, False
-            )
+            if not pending.state_only:
+                self.cache.tree_core.finish_external_linker_offload(
+                    pending.publish_node_ids, pending.lock_node_id, False
+                )
             self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
         self.pending_offloads.clear()
 
